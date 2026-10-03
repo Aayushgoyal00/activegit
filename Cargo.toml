@@ -3,11 +3,11 @@ resolver = "2"
 members = ["git-tui-core", "git-tui", "bench"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1-windows.1"
 edition = "2021"
 license = "MIT"
 rust-version = "1.88"
-repository = "https://github.com/DevarshVasani/activegit"
+repository = "https://github.com/Aayushgoyal00/activegit"
 
 [profile.release]
 lto = true
