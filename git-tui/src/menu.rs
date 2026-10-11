@@ -41,12 +41,25 @@ pub(crate) struct MenuEntry {
     pub destructive: bool,
 }
 
-/// Entries for the panel that has focus. Actions on "the selected" file,
+/// Where the menu was opened from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuContext {
+    /// The main view, with this panel focused.
+    Panel(Focus),
+    /// The fullscreen diff.
+    FullDiff,
+}
+
+/// Entries for where the menu was opened. Actions on "the selected" file,
 /// hunk, branch or stash only appear while their panel is focused, so the
 /// thing they act on is the one highlighted behind the menu.
-pub(crate) fn entries(focus: Focus) -> Vec<MenuEntry> {
+pub(crate) fn entries(context: MenuContext) -> Vec<MenuEntry> {
     use FooterAction as F;
     use MenuAction as M;
+    let focus = match context {
+        MenuContext::Panel(focus) => focus,
+        MenuContext::FullDiff => return fullscreen_entries(),
+    };
     let entry = |group, label, action| MenuEntry {
         group,
         label,
@@ -68,6 +81,7 @@ pub(crate) fn entries(focus: Focus) -> Vec<MenuEntry> {
         ]),
         Focus::Diff => out.extend([
             entry("Diff", "Stage hunk", M::Footer(F::StageHunk)),
+            entry("Diff", "Copy selection", M::Footer(F::Copy)),
             entry("Diff", "Open full diff", M::Footer(F::OpenDiff)),
             danger("Diff", "Restore hunk", M::Footer(F::RestoreHunk)),
         ]),
@@ -140,6 +154,35 @@ pub(crate) fn entries(focus: Focus) -> Vec<MenuEntry> {
     out
 }
 
+/// What can be done from inside the fullscreen diff.
+fn fullscreen_entries() -> Vec<MenuEntry> {
+    use FooterAction as F;
+    use MenuAction as M;
+    let entry = |group, label, action, destructive| MenuEntry {
+        group,
+        label,
+        action,
+        destructive,
+    };
+    vec![
+        entry("Diff", "Stage hunk", M::Footer(F::StageHunk), false),
+        entry("Diff", "Copy selection", M::Footer(F::Copy), false),
+        entry("Diff", "Restore hunk", M::Footer(F::RestoreHunk), true),
+        entry("Diff", "Discard file changes", M::Footer(F::Discard), true),
+        entry("Diff", "Close diff", M::Footer(F::CloseDiff), false),
+        entry("Files", "Find file", M::Footer(F::Find), false),
+        entry(
+            "Files",
+            "Toggle Markdown preview",
+            M::MarkdownPreview,
+            false,
+        ),
+        entry("Sync", "Pull", M::Footer(F::Pull), false),
+        entry("Sync", "Push", M::Footer(F::Push), false),
+        entry("Settings", "Quit", M::Quit, false),
+    ]
+}
+
 /// The key that does the same thing, for the hint column. Follows the
 /// user's bindings; empty when the action has no key.
 pub(crate) fn key_hint(action: MenuAction, keys: &KeyBindings) -> String {
@@ -163,6 +206,7 @@ pub(crate) fn key_hint(action: MenuAction, keys: &KeyBindings) -> String {
         M::Footer(F::StashPush) => &keys.stash_push,
         M::Footer(F::StashDrop) => &keys.stash_drop,
         M::Footer(F::Menu) => &keys.action_menu,
+        M::Footer(F::Copy) => &[KeyCode::Char('y')],
         M::Refresh => &keys.refresh,
         M::MarkdownPreview => &keys.toggle_markdown_preview,
         M::LlmSettings => &keys.llm_settings,
@@ -208,7 +252,11 @@ mod tests {
 
     #[test]
     fn selection_actions_only_show_for_the_focused_panel() {
-        let has = |focus, label: &str| entries(focus).iter().any(|e| e.label == label);
+        let has = |focus, label: &str| {
+            entries(MenuContext::Panel(focus))
+                .iter()
+                .any(|e| e.label == label)
+        };
         assert!(has(Focus::Status, "Discard changes"));
         assert!(!has(Focus::Branches, "Discard changes"));
         assert!(has(Focus::Branches, "Delete selected branch"));
@@ -246,7 +294,7 @@ mod tests {
             Focus::Stash,
             Focus::Diff,
         ] {
-            for e in entries(focus) {
+            for e in entries(MenuContext::Panel(focus)) {
                 let discards = matches!(
                     e.action,
                     MenuAction::Footer(
@@ -280,5 +328,23 @@ mod tests {
             key_hint(MenuAction::Footer(FooterAction::Commit), &keys),
             ""
         );
+    }
+
+    #[test]
+    fn fullscreen_menu_reaches_the_destructive_actions_too() {
+        let labels: Vec<&str> = entries(MenuContext::FullDiff)
+            .iter()
+            .map(|e| e.label)
+            .collect();
+        for label in [
+            "Stage hunk",
+            "Restore hunk",
+            "Discard file changes",
+            "Close diff",
+        ] {
+            assert!(labels.contains(&label), "{label} missing");
+        }
+        // Nothing that needs the main view behind it.
+        assert!(!labels.contains(&"Theme"));
     }
 }

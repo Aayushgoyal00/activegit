@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::config::{Config, KeyBindings, Theme};
 use crate::fuzzy;
 use crate::input::Chord;
-use crate::menu::{MenuAction, MenuEntry, WorkspaceRequest};
+use crate::menu::{MenuAction, MenuContext, MenuEntry, WorkspaceRequest};
 use crate::ui::{
     cursor_line_text, diff_rows, footer_button_at, footer_buttons, panel_divider_ys,
     rail_divider_x, visible_file_rows, wrap_draft, DiffRow, FileRow, FooterAction, LayoutOverrides,
@@ -339,6 +339,19 @@ pub struct App {
     menu_selected: usize,
     /// A menu action only the workspace can run (it owns the tabs).
     workspace_request: Option<WorkspaceRequest>,
+    /// Where the actions menu was opened from (main view or fullscreen
+    /// diff); closing it returns there.
+    menu_return: Mode,
+    /// Last left-press (time, column, row) and whether the current press
+    /// is the second of a double-click. One click selects, a double-click
+    /// opens: a click to refocus must not open what happens to be
+    /// selected.
+    last_click: Option<(Instant, u16, u16)>,
+    double_click: bool,
+    /// Diff row where a drag-select started, and whether the drag has
+    /// begun selecting (it only does once the pointer leaves that row).
+    drag_anchor: Option<usize>,
+    drag_selecting: bool,
     /// Kind of each job still waiting for its result.
     inflight: HashMap<JobId, Pending>,
     /// The error line came from a failed job: the status refresh that
@@ -374,7 +387,13 @@ pub struct App {
 pub(crate) enum DragTarget {
     RailV,
     Panel(usize),
+    /// Dragging over diff rows: selects the lines from where the button
+    /// went down to the pointer.
+    Select,
 }
+
+/// Two presses on the same row this close together are a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(450);
 
 /// Which click hit map to read/record (see [`App::set_hit`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,6 +730,11 @@ impl App {
             menu_hit: std::cell::RefCell::new(Vec::new()),
             menu_selected: 0,
             workspace_request: None,
+            menu_return: Mode::Normal,
+            last_click: None,
+            double_click: false,
+            drag_anchor: None,
+            drag_selecting: false,
             inflight: HashMap::new(),
             error_sticky: false,
             commit_stash: String::new(),
@@ -1147,11 +1171,13 @@ impl App {
         }
     }
 
-    /// `?`: open the actions menu for the focused panel.
+    /// `?`: open the actions menu for the focused panel, or for the
+    /// fullscreen diff.
     pub fn begin_action_menu(&mut self) {
-        if self.mode != Mode::Normal {
+        if !matches!(self.mode, Mode::Normal | Mode::FullDiff) {
             return;
         }
+        self.menu_return = self.mode;
         self.mode = Mode::ActionMenu;
         self.draft.clear();
         self.draft_cursor = 0;
@@ -1164,7 +1190,7 @@ impl App {
     /// match first otherwise. Labels are matched first; group names match
     /// too (`sync`, `stash`) and those entries follow.
     pub(crate) fn menu_matches(&self) -> Vec<MenuEntry> {
-        let all = crate::menu::entries(self.focus);
+        let all = crate::menu::entries(self.menu_context());
         let query = self.draft.trim().to_lowercase();
         if query.is_empty() {
             return all;
@@ -1186,6 +1212,19 @@ impl App {
         order.into_iter().map(|i| all[i]).collect()
     }
 
+    fn menu_context(&self) -> MenuContext {
+        if self.menu_return == Mode::FullDiff {
+            MenuContext::FullDiff
+        } else {
+            MenuContext::Panel(self.focus)
+        }
+    }
+
+    /// The view the actions menu was opened over.
+    pub fn menu_return(&self) -> Mode {
+        self.menu_return
+    }
+
     /// Highlighted row among [`Self::menu_matches`].
     pub fn menu_selected(&self) -> usize {
         self.menu_selected
@@ -1199,7 +1238,7 @@ impl App {
     }
 
     fn close_action_menu(&mut self) {
-        self.mode = Mode::Normal;
+        self.mode = self.menu_return;
         self.draft.clear();
         self.draft_cursor = 0;
     }
@@ -1282,7 +1321,7 @@ impl App {
         let Some(index) = self.hit(HitMap::ActionMenu, row) else {
             return;
         };
-        if index == self.menu_selected {
+        if index == self.menu_selected && self.double_click {
             self.activate_menu_entry();
         } else {
             self.menu_selected = index;
@@ -1295,7 +1334,7 @@ impl App {
         let Some(index) = self.hit(HitMap::ThemePicker, row) else {
             return;
         };
-        if index == self.theme_selected {
+        if index == self.theme_selected && self.double_click {
             self.confirm_theme_picker();
         } else {
             self.theme_picker_select(index);
@@ -2270,10 +2309,49 @@ impl App {
         std::mem::take(&mut self.workspace_keys)
     }
 
+    /// Record a left-press and work out whether it completes a
+    /// double-click. Returns that, for callers outside the app.
+    pub(crate) fn note_click(&mut self, col: u16, row: u16) -> bool {
+        let now = Instant::now();
+        self.double_click = self.last_click.is_some_and(|(at, c, r)| {
+            now.duration_since(at) < DOUBLE_CLICK && r == row && c.abs_diff(col) <= 1
+        });
+        // A third press starts over instead of chaining doubles.
+        self.last_click = if self.double_click {
+            None
+        } else {
+            Some((now, col, row))
+        };
+        self.double_click
+    }
+
+    /// Right-click: select what is under the pointer, then open the
+    /// actions menu for it (the menu is already scoped to the panel).
+    pub fn on_right_click(&mut self, col: u16, row: u16) {
+        self.double_click = false;
+        match self.mode {
+            Mode::Normal => {
+                if let Some(layout) = self.last_layout.get() {
+                    if row < layout.footer.y {
+                        self.click_normal(col, row, &layout);
+                    }
+                }
+            }
+            Mode::FullDiff => {
+                if let Some(idx) = self.hit(HitMap::Full, row) {
+                    self.point_cursor_at(idx);
+                }
+            }
+            _ => return,
+        }
+        self.drag = None;
+        self.begin_action_menu();
+    }
+
     /// Popup handling shared by every mode with one open: buttons first,
     /// then "click outside closes" for the popups where closing loses
     /// nothing. Returns whether the click was consumed.
-    fn click_popup(&mut self, col: u16, row: u16) -> bool {
+    pub(crate) fn click_popup(&mut self, col: u16, row: u16) -> bool {
         let button = self
             .clicks
             .borrow()
@@ -2580,6 +2658,8 @@ impl App {
                 self.mode = Mode::Normal;
                 self.snap_scroll_to_cursor();
             }
+        } else if k.action_menu.contains(&key) {
+            self.begin_action_menu();
         } else if k.toggle_markdown_preview.contains(&key) {
             self.toggle_markdown_preview();
         } else if k.find_files.contains(&key) {
@@ -2923,6 +3003,11 @@ impl App {
     /// keyboard (commit, branch, stash, LLM, push/pull prompts), except
     /// the push confirm box, whose buttons are clickable.
     pub fn on_mouse_down(&mut self, col: u16, row: u16) {
+        self.note_click(col, row);
+        // A release lost outside the window must not leave a drag armed.
+        self.drag = None;
+        self.drag_anchor = None;
+        self.drag_selecting = false;
         if !matches!(self.mode, Mode::Normal | Mode::FullDiff) && self.click_popup(col, row) {
             return;
         }
@@ -2970,15 +3055,14 @@ impl App {
         }
         // Divider drags win over panel clicks (1-cell grip tolerance).
         let dx = rail_divider_x(&layout);
-        if row < footer.y && (col == dx || col.saturating_add(1) == dx) {
+        let in_body = row >= layout.status.y && row < footer.y;
+        if in_body && (col == dx || col.saturating_add(1) == dx) {
             self.drag = Some(DragTarget::RailV);
-            self.on_mouse_drag(col, row);
             return;
         }
         for (i, dy) in panel_divider_ys(&layout).iter().enumerate() {
             if row == *dy && col < dx {
                 self.drag = Some(DragTarget::Panel(i));
-                self.on_mouse_drag(col, row);
                 return;
             }
         }
@@ -2989,13 +3073,17 @@ impl App {
     /// Dividers only exist in the normal layout, so a drag that outlives
     /// a mode switch is dropped.
     pub fn on_mouse_drag(&mut self, col: u16, row: u16) {
+        let Some(target) = self.drag else {
+            return;
+        };
+        if target == DragTarget::Select {
+            self.drag_select(row);
+            return;
+        }
         if self.mode != Mode::Normal {
             self.drag = None;
             return;
         }
-        let Some(target) = self.drag else {
-            return;
-        };
         let Some(layout) = self.last_layout.get() else {
             return;
         };
@@ -3012,8 +3100,14 @@ impl App {
                     .saturating_sub(20)
                     .max(low)
                     .min(crate::ui::MAX_RAIL_W.max(low));
-                let want = col.saturating_sub(origin_x).clamp(low, high.max(low));
-                self.layout_overrides.rail_w = Some(want);
+                let mut want = col.saturating_sub(origin_x);
+                // With the diff focused the rail is drawn at two thirds of
+                // its stored width: store what puts the edge under the
+                // pointer.
+                if self.focus == Focus::Diff {
+                    want = want.saturating_mul(3) / 2;
+                }
+                self.layout_overrides.rail_w = Some(want.clamp(low, high.max(low)));
             }
             DragTarget::Panel(i) => {
                 let rect = [layout.status, layout.files, layout.branches, layout.commits][i];
@@ -3023,69 +3117,140 @@ impl App {
                     .max(crate::ui::MIN_PANEL_H);
                 self.layout_overrides.heights[i] = Some(want);
             }
+            DragTarget::Select => {}
         }
     }
 
-    /// Left-release: end any divider drag.
+    /// Dragging over the diff selects whole lines, from the row the button
+    /// went down on to the row under the pointer. Past the top or bottom
+    /// edge the view scrolls a line at a time. The selection is the same
+    /// one `V` makes, so `y` or `[Copy]` yanks it.
+    fn drag_select(&mut self, row: u16) {
+        let map = match self.mode {
+            Mode::FullDiff => HitMap::Full,
+            Mode::Normal => HitMap::Preview,
+            _ => {
+                self.drag = None;
+                return;
+            }
+        };
+        let Some(anchor) = self.drag_anchor else {
+            return;
+        };
+        let target = match self.hit(map, row) {
+            Some(idx) => idx,
+            None => {
+                let (first, last) = {
+                    let hits = self.hit_map(map);
+                    match (hits.first(), hits.last()) {
+                        (Some(first), Some(last)) => (first.0, last.0),
+                        _ => return,
+                    }
+                };
+                if row < first {
+                    self.cursor.saturating_sub(1)
+                } else if row > last {
+                    self.cursor + 1
+                } else {
+                    return;
+                }
+            }
+        };
+        if !self.drag_selecting {
+            if target == anchor {
+                return;
+            }
+            self.drag_selecting = true;
+            self.point_cursor_at(anchor);
+            self.visual = Some(Visual {
+                anchor_row: self.cursor_row(),
+                anchor_col: 0,
+                mode: VisualMode::Linewise,
+            });
+        }
+        self.point_cursor_at(target);
+    }
+
+    /// Left-release: end any drag. A drag-selection stays for `y`.
     pub fn on_mouse_up(&mut self) {
+        if self.drag_selecting && self.visual.is_some() {
+            self.notice = Some("selected: y or [Copy] copies, esc clears".into());
+        }
         self.drag = None;
+        self.drag_anchor = None;
+        self.drag_selecting = false;
     }
 
-    /// Scroll wheel at `(col, row)`: `up == true` is wheel-up.
-    pub fn on_wheel(&mut self, col: u16, row: u16, up: bool) {
-        if !matches!(self.mode, Mode::Normal | Mode::FullDiff) {
+    /// Scroll the diff view by `delta` lines and keep the line cursor
+    /// inside what is shown (the view moves, the cursor follows, like
+    /// scrolling in an editor).
+    fn wheel_diff(&mut self, delta: isize) {
+        self.scroll_diff_by(delta);
+        if self.show_markdown_preview() || self.diff_rows.is_empty() {
             return;
         }
-        let delta: isize = if up { -3 } else { 3 };
+        let scroll = self.diff_scroll as usize;
+        let last = self.diff_rows.len() - 1;
         if self.mode == Mode::FullDiff {
-            self.move_cursor_or_scroll(delta);
-            return;
+            let h = self.full_view_h.get().max(1);
+            self.cursor = self
+                .cursor
+                .clamp(scroll.min(last), (scroll + h - 1).min(last));
+        } else {
+            let h = self.prev_view_h.get().max(1);
+            let start_of = |row: usize| crate::ui::rows_unified_len(&self.diff_rows[..row]);
+            let mut cursor = self.cursor.min(last);
+            while cursor < last && start_of(cursor) < scroll {
+                cursor += 1;
+            }
+            while cursor > 0
+                && start_of(cursor) + crate::ui::unified_row_count(&self.diff_rows[cursor])
+                    > scroll + h
+            {
+                cursor -= 1;
+            }
+            self.cursor = cursor;
+        }
+        self.sync_hunk_to_cursor();
+    }
+
+    /// Scroll wheel at `(col, row)`: `up == true` is wheel-up. It scrolls
+    /// whatever is under the pointer and never moves focus (panels resize
+    /// with focus, which would slide them out from under the pointer).
+    pub fn on_wheel(&mut self, col: u16, row: u16, up: bool) {
+        let step: isize = if up { -1 } else { 1 };
+        match self.mode {
+            Mode::FindFile => return self.finder_move(step),
+            Mode::ActionMenu => {
+                let last = self.menu_matches().len().saturating_sub(1) as isize;
+                self.menu_selected = (self.menu_selected as isize + step).clamp(0, last) as usize;
+                return;
+            }
+            Mode::ThemePicker => {
+                let last = Theme::names().count().saturating_sub(1) as isize;
+                let next = (self.theme_selected as isize + step).clamp(0, last);
+                return self.theme_picker_select(next as usize);
+            }
+            Mode::FullDiff => return self.wheel_diff(step * 3),
+            Mode::Normal => {}
+            _ => return,
         }
         let Some(layout) = self.last_layout.get() else {
             return;
         };
         if mouse_in(col, row, layout.files) {
-            self.focus = Focus::Status;
-            if up {
-                self.step_tree(false);
-            } else {
-                self.step_tree(true);
-            }
+            self.step_tree(!up);
         } else if mouse_in(col, row, layout.branches) {
-            self.focus = Focus::Branches;
-            let n = self.branch_count();
-            if n > 0 {
-                if up {
-                    self.branch_selected = self.branch_selected.saturating_sub(3);
-                } else {
-                    self.branch_selected = (self.branch_selected + 3).min(n - 1);
-                }
-            }
+            let last = self.branch_count().saturating_sub(1) as isize;
+            self.branch_selected = (self.branch_selected as isize + step).clamp(0, last) as usize;
         } else if mouse_in(col, row, layout.commits) {
-            self.focus = Focus::Log;
-            let n = self.log_count();
-            if n > 0 {
-                if up {
-                    self.log_selected = self.log_selected.saturating_sub(3);
-                } else {
-                    self.log_selected = (self.log_selected + 3).min(n - 1);
-                }
-            }
+            let last = self.log_count().saturating_sub(1) as isize;
+            self.log_selected = (self.log_selected as isize + step).clamp(0, last) as usize;
         } else if mouse_in(col, row, layout.stash) {
-            self.focus = Focus::Stash;
-            let n = self.stash_count();
-            if n > 0 {
-                if up {
-                    self.stash_selected = self.stash_selected.saturating_sub(3);
-                } else {
-                    self.stash_selected = (self.stash_selected + 3).min(n - 1);
-                }
-            }
-        } else if mouse_in(col, row, layout.diff) {
-            self.focus = Focus::Diff;
-            self.move_cursor_or_scroll(delta);
-        } else if mouse_in(col, row, layout.status) {
-            self.focus = Focus::Status;
+            let last = self.stash_count().saturating_sub(1) as isize;
+            self.stash_selected = (self.stash_selected as isize + step).clamp(0, last) as usize;
+        } else if mouse_in(col, row, layout.diff) && self.focus != Focus::Log {
+            self.wheel_diff(step * 3);
         }
     }
 
@@ -3097,14 +3262,19 @@ impl App {
             self.focus = Focus::Status;
         } else if mouse_in(col, row, layout.files) {
             self.focus = Focus::Status;
-            self.click_file_row(layout, row);
+            self.click_file_row(layout, col, row);
         } else if mouse_in(col, row, layout.branches) {
             self.focus = Focus::Branches;
             let scroll = self.branch_scroll.get();
             let count = self.branch_count();
-            self.click_list_row(row, layout.branches, scroll, count, |app, i| {
+            let before = self.branch_selected;
+            let hit = self.click_list_row(row, layout.branches, scroll, count, |app, i| {
                 app.branch_selected = i;
             });
+            // Double-click a branch to check it out.
+            if hit && self.double_click && self.branch_selected == before {
+                self.checkout_selected_branch();
+            }
         } else if mouse_in(col, row, layout.commits) {
             self.focus = Focus::Log;
             let scroll = self.log_scroll.get();
@@ -3120,17 +3290,32 @@ impl App {
                 app.stash_selected = i;
             });
         } else if mouse_in(col, row, layout.diff) {
+            // With the commits panel focused this area shows the commit
+            // overview, not diff rows: there is nothing to point at.
+            if self.focus == Focus::Log {
+                return;
+            }
             self.focus = Focus::Diff;
             if let Some(idx) = self.hit(HitMap::Preview, row) {
-                // Same as fullscreen: header click jumps to that hunk,
-                // row click moves the cursor there.
-                if let Some(crate::ui::DiffRow::Header { index }) = self.diff_rows.get(idx) {
-                    let index = *index;
-                    self.point_hunk_at(index);
-                } else {
-                    self.point_cursor_at(idx);
-                }
+                self.click_diff_row(idx);
             }
+        }
+    }
+
+    /// A press on a diff row (preview or fullscreen): a header jumps to
+    /// that hunk, any other row takes the line cursor and may start a
+    /// drag-selection.
+    fn click_diff_row(&mut self, idx: usize) {
+        if self.show_markdown_preview() {
+            return;
+        }
+        if let Some(crate::ui::DiffRow::Header { index }) = self.diff_rows.get(idx) {
+            let index = *index;
+            self.point_hunk_at(index);
+        } else {
+            self.point_cursor_at(idx);
+            self.drag = Some(DragTarget::Select);
+            self.drag_anchor = Some(self.cursor);
         }
     }
 
@@ -3143,29 +3328,28 @@ impl App {
         scroll: usize,
         count: usize,
         select: impl FnOnce(&mut Self, usize),
-    ) {
-        if count == 0 {
-            return;
+    ) -> bool {
+        // The title and bottom border belong to the panel, not to a row.
+        if count == 0 || row <= rect.y || row >= rect.y + rect.height.saturating_sub(1) {
+            return false;
         }
-        let visible = rect.height.saturating_sub(2) as usize;
-        let inner = row.saturating_sub(rect.y.saturating_add(1)) as usize;
-        if inner >= visible {
-            return;
+        let inner = (row - rect.y - 1) as usize;
+        if inner.saturating_add(scroll) >= count {
+            return false;
         }
-        let idx = inner.saturating_add(scroll).min(count - 1);
-        select(self, idx);
+        select(self, inner + scroll);
+        true
     }
 
-    /// Click a files-tree row: focus the file list and select the row. A
-    /// click on the already-selected file opens it fullscreen (mouse
-    /// double-click without a timer).
-    fn click_file_row(&mut self, layout: &ScreenLayout, row: u16) {
+    /// Click a files-tree row: select it. A double-click opens the file
+    /// fullscreen; a click on a folder's arrow folds or unfolds it.
+    fn click_file_row(&mut self, layout: &ScreenLayout, col: u16, row: u16) {
         let rect = layout.files;
-        let visible = rect.height.saturating_sub(2) as usize;
-        let inner = row.saturating_sub(rect.y.saturating_add(1)) as usize;
-        if inner >= visible {
+        // The title and bottom border belong to the panel, not to a row.
+        if row <= rect.y || row >= rect.y + rect.height.saturating_sub(1) {
             return;
         }
+        let inner = (row - rect.y - 1) as usize;
         let rows = visible_file_rows(&self.file_list, |d| self.collapsed.contains(d));
         let pos = inner.saturating_add(self.files_scroll.get());
         let Some(target) = rows.get(pos).cloned() else {
@@ -3173,40 +3357,58 @@ impl App {
         };
         match target {
             FileRow::File { index, .. } => {
-                if Some(index) == Some(self.selected) && self.dir_cursor.is_none() {
-                    self.open_full_diff();
+                if index == self.selected && self.dir_cursor.is_none() {
+                    if self.double_click {
+                        self.open_full_diff();
+                    }
                 } else {
                     self.selected = index;
                     self.dir_cursor = None;
                     self.maybe_load_diff();
                 }
             }
-            FileRow::Dir { path, .. } => {
+            FileRow::Dir { path, depth } => {
                 let dir = path.to_string();
-                if self.cursor_dir().is_some_and(|d| d == dir) {
-                    // Second click on an open header previews its first
-                    // file fullscreen instead.
+                // Border, the two-cell selection marker, the indent, then
+                // the arrow and the space after it.
+                let arrow_end = rect.x as usize + 1 + 2 + depth * 2 + 2;
+                let on_arrow = (col as usize) < arrow_end;
+                let was_collapsed = self.collapsed.contains(&dir);
+                let already_here = self.cursor_dir().is_some_and(|d| d == dir);
+                if on_arrow {
+                    self.select_folder(&dir, !was_collapsed);
+                    self.set_collapsed(&dir, !was_collapsed);
+                } else if already_here && self.double_click {
+                    // Double-click an open header: its first file, fullscreen.
                     self.open_full_diff();
-                } else if self.collapsed.contains(&dir) {
-                    if let Some(anchor) = self.folder_anchor(&dir, true) {
-                        self.selected = anchor;
-                    }
-                    self.dir_cursor = None;
-                    self.maybe_load_diff();
                 } else {
-                    let prefix = format!("{dir}/");
-                    if let Some(first) = self
-                        .file_list
-                        .iter()
-                        .position(|f| f.path.starts_with(&prefix))
-                    {
-                        self.selected = first;
-                    }
-                    self.dir_cursor = Some(dir);
-                    self.maybe_load_diff();
+                    self.select_folder(&dir, was_collapsed);
                 }
             }
         }
+    }
+
+    /// Put the cursor on folder `dir`: on its header when it is (or will
+    /// be) open, on the hidden anchor that highlights the `▶` row when
+    /// collapsed.
+    fn select_folder(&mut self, dir: &str, collapsed: bool) {
+        if collapsed {
+            if let Some(anchor) = self.folder_anchor(dir, true) {
+                self.selected = anchor;
+            }
+            self.dir_cursor = None;
+        } else {
+            let prefix = format!("{dir}/");
+            if let Some(first) = self
+                .file_list
+                .iter()
+                .position(|f| f.path.starts_with(&prefix))
+            {
+                self.selected = first;
+            }
+            self.dir_cursor = Some(dir.to_string());
+        }
+        self.maybe_load_diff();
     }
 
     /// Click inside the fullscreen diff: move the cursor to the clicked
@@ -3234,12 +3436,7 @@ impl App {
         let Some(idx) = self.hit(HitMap::Full, row) else {
             return;
         };
-        if let Some(crate::ui::DiffRow::Header { index }) = self.diff_rows.get(idx) {
-            let index = *index;
-            self.point_hunk_at(index);
-        } else {
-            self.point_cursor_at(idx);
-        }
+        self.click_diff_row(idx);
     }
 
     /// Click the push confirm box's `[Push]` / `[Cancel]` buttons
@@ -3269,7 +3466,7 @@ impl App {
         let Some(pos) = self.hit(HitMap::Finder, row) else {
             return;
         };
-        if pos == self.finder_cursor() {
+        if pos == self.finder_cursor() && self.double_click {
             self.expand_selected();
             self.submit_finder();
         } else {
@@ -3302,6 +3499,7 @@ impl App {
             FooterAction::Find => self.open_finder(),
             FooterAction::Theme => self.begin_theme_picker(),
             FooterAction::Menu => self.begin_action_menu(),
+            FooterAction::Copy => self.begin_yank(),
             FooterAction::OpenDiff => self.open_full_diff(),
             FooterAction::CloseDiff => {
                 if self.mode == Mode::FullDiff {
@@ -8207,5 +8405,220 @@ mod tests {
             .add_click(Rect::new(12, 10, 5, 1), UiClick::Key(KeyCode::Enter));
         fx.app.on_mouse_down(13, 10);
         wait_for(&mut fx.app, |st| st.files.is_empty());
+    }
+
+    // ---- mouse ----
+
+    /// Make the next press count as a fresh single click, as if the last
+    /// one was long ago.
+    fn forget_last_click(app: &mut App) {
+        app.last_click = None;
+    }
+
+    #[test]
+    fn wheel_scrolls_under_the_pointer_without_moving_focus() {
+        let mut fx = harness(&["a.txt", "b.txt", "c.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        fx.app.on_key(KeyCode::Char('2'));
+        assert_eq!(fx.app.focus(), Focus::Branches);
+        // Over the file list: the selection steps, focus stays.
+        fx.app
+            .on_wheel(layout.files.x + 2, layout.files.y + 2, false);
+        assert_eq!(fx.app.selected(), 1);
+        assert_eq!(fx.app.focus(), Focus::Branches);
+        // Over the diff: still no focus change.
+        fx.app.on_wheel(layout.diff.x + 2, layout.diff.y + 2, false);
+        assert_eq!(fx.app.focus(), Focus::Branches);
+    }
+
+    #[test]
+    fn wheel_in_the_diff_scrolls_the_view_and_the_cursor_follows() {
+        let mut fx = two_hunk_fixture();
+        let layout = mouse_layout(&mut fx.app);
+        fx.app.set_view_h_for_test(10, 10);
+        assert_eq!(fx.app.diff_scroll(), 0);
+        assert_eq!(fx.app.cursor_row(), 0);
+        let (x, y) = (layout.diff.x + 2, layout.diff.y + 2);
+        fx.app.on_wheel(x, y, false);
+        // The view moved at once (it used to wait for the cursor to reach
+        // the bottom edge), and the cursor was pulled inside it.
+        assert_eq!(fx.app.diff_scroll(), 3);
+        assert!(
+            fx.app.cursor_row() >= 1,
+            "cursor left behind above the view"
+        );
+        fx.app.on_wheel(x, y, true);
+        assert_eq!(fx.app.diff_scroll(), 0);
+    }
+
+    #[test]
+    fn wheel_moves_the_selection_inside_popups() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('?'));
+        fx.app.on_wheel(0, 0, false);
+        fx.app.on_wheel(0, 0, false);
+        assert_eq!(fx.app.menu_selected(), 2);
+        fx.app.on_wheel(0, 0, true);
+        assert_eq!(fx.app.menu_selected(), 1);
+        // No wrap at the ends.
+        for _ in 0..5 {
+            fx.app.on_wheel(0, 0, true);
+        }
+        assert_eq!(fx.app.menu_selected(), 0);
+        fx.app.on_key(KeyCode::Esc);
+        fx.app.on_key(KeyCode::Char('T'));
+        fx.app.on_wheel(0, 0, false);
+        assert_eq!(fx.app.theme(), Theme::by_name("tokyo-night").unwrap());
+    }
+
+    #[test]
+    fn clicking_a_panel_title_does_not_select_a_row() {
+        let mut fx = harness(&["a.txt", "b.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.selected(), 1);
+        // The title border row of the files panel.
+        fx.app.on_mouse_down(layout.files.x + 3, layout.files.y);
+        assert_eq!(fx.app.selected(), 1, "title click must not jump to row 0");
+        assert_eq!(fx.app.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn one_click_on_the_selected_file_does_not_open_it() {
+        let mut fx = harness(&["a.txt", "b.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        let y0 = layout.files.y + 1;
+        // a.txt is selected already; coming back to the list with one
+        // click must only focus it.
+        fx.app.on_key(KeyCode::Char('5'));
+        fx.app.on_mouse_down(2, y0);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(fx.app.focus(), Focus::Status);
+        // A slow second click is still just a click.
+        forget_last_click(&mut fx.app);
+        fx.app.on_mouse_down(2, y0);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        // Two quick ones open it.
+        fx.app.on_mouse_down(2, y0);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+    }
+
+    #[test]
+    fn right_click_selects_then_opens_the_menu_for_that_panel() {
+        let mut fx = harness(&["a.txt", "b.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        fx.app.on_right_click(2, layout.files.y + 2);
+        assert_eq!(fx.app.mode(), Mode::ActionMenu);
+        assert_eq!(fx.app.selected_file().unwrap().path, "b.txt");
+        assert!(fx
+            .app
+            .menu_matches()
+            .iter()
+            .any(|e| e.label == "Discard changes"));
+        fx.app.on_key(KeyCode::Esc);
+        // Over the branches panel the menu is the branches menu.
+        fx.app.on_right_click(2, layout.branches.y + 1);
+        assert_eq!(fx.app.focus(), Focus::Branches);
+        assert!(fx
+            .app
+            .menu_matches()
+            .iter()
+            .all(|e| e.label != "Discard changes"));
+    }
+
+    #[test]
+    fn clicking_a_folder_arrow_folds_and_unfolds_it() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "src/a.rs", "a\n", "init");
+        commit_file(&repo, "top.txt", "t\n", "init");
+        let root = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(root.join("src/a.rs"), "a2\n").unwrap();
+        drop(repo);
+        let mut fx = Fixture {
+            _dir: dir,
+            app: App::new(JobQueue::spawn(root).unwrap()),
+        };
+        wait_for(&mut fx.app, |st| st.files.len() == 1);
+        let layout = mouse_layout(&mut fx.app);
+        let header_y = layout.files.y + 1;
+        assert!(!fx.app.is_collapsed("src"));
+        // The arrow sits right after the border and selection marker.
+        fx.app.on_mouse_down(layout.files.x + 3, header_y);
+        assert!(fx.app.is_collapsed("src"), "arrow click folds");
+        forget_last_click(&mut fx.app);
+        fx.app.on_mouse_down(layout.files.x + 3, header_y);
+        assert!(!fx.app.is_collapsed("src"), "arrow click unfolds");
+        // A click on the name only selects.
+        forget_last_click(&mut fx.app);
+        fx.app.on_mouse_down(layout.files.x + 12, header_y);
+        assert!(!fx.app.is_collapsed("src"));
+        assert_eq!(fx.app.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn dragging_over_the_diff_selects_lines_for_copy() {
+        let mut fx = two_hunk_fixture();
+        let layout = mouse_layout(&mut fx.app);
+        let y = layout.diff.y + 2;
+        fx.app.set_hit(
+            HitMap::Preview,
+            vec![(y, 1), (y + 1, 2), (y + 2, 3), (y + 3, 4)],
+        );
+        let x = layout.diff.x + 4;
+        fx.app.on_mouse_down(x, y);
+        // A press without moving selects nothing.
+        assert!(fx.app.visual().is_none());
+        fx.app.on_mouse_drag(x, y + 2);
+        let visual = fx.app.visual().expect("drag starts a selection");
+        assert_eq!(visual.mode, VisualMode::Linewise);
+        assert_eq!(visual.anchor_row, 1);
+        assert_eq!(fx.app.cursor_row(), 3);
+        fx.app.on_mouse_up();
+        // The selection survives the release and yanks three lines.
+        let text = fx.app.yank_text().unwrap();
+        assert_eq!(text.lines().count(), 3, "got {text:?}");
+        // Dragging without a press in the diff does nothing.
+        fx.app.on_mouse_drag(x, y + 3);
+        assert_eq!(fx.app.cursor_row(), 3);
+    }
+
+    #[test]
+    fn pressing_a_divider_without_moving_does_not_resize() {
+        let mut fx = harness(&["a.txt"]);
+        let layout = mouse_layout(&mut fx.app);
+        let before = fx.app.layout_overrides();
+        let dx = crate::ui::rail_divider_x(&layout);
+        fx.app.on_mouse_down(dx, layout.files.y + 1);
+        fx.app.on_mouse_up();
+        assert_eq!(fx.app.layout_overrides(), before);
+    }
+
+    #[test]
+    fn menu_opens_from_the_fullscreen_diff_and_returns_to_it() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        fx.app.on_key(KeyCode::Char('?'));
+        assert_eq!(fx.app.mode(), Mode::ActionMenu);
+        let labels: Vec<&str> = fx.app.menu_matches().iter().map(|e| e.label).collect();
+        assert!(labels.contains(&"Restore hunk"), "{labels:?}");
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::FullDiff, "esc returns to the diff");
+        fx.app.on_key(KeyCode::Char('?'));
+        type_into_menu(&mut fx.app, "close");
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn commits_panel_offers_no_stage_button() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('3'));
+        let labels: Vec<&str> = crate::ui::footer_buttons(&fx.app)
+            .iter()
+            .map(|(label, _)| *label)
+            .collect();
+        assert!(!labels.contains(&"Stage"), "{labels:?}");
+        assert!(labels.contains(&"Menu"));
     }
 }

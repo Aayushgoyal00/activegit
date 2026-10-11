@@ -160,9 +160,9 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
     let _ = terminal.show_cursor();
 }
 
-/// Map a crossterm mouse event to a workspace action. Only left-button
-/// press/drag/release and the wheel are handled; anything else (middle/
-/// right buttons, hover moves) is ignored so the keyboard stays primary.
+/// Map a crossterm mouse event to a workspace action: left-button
+/// press/drag/release, the wheel, and right-press (context menu). Hover
+/// moves and the middle button are ignored.
 fn map_mouse(kind: MouseEventKind, col: u16, row: u16) -> Option<workspace::MouseAction> {
     use workspace::MouseAction;
     match kind {
@@ -171,6 +171,7 @@ fn map_mouse(kind: MouseEventKind, col: u16, row: u16) -> Option<workspace::Mous
         MouseEventKind::Up(MouseButton::Left) => Some(MouseAction::Up),
         MouseEventKind::ScrollUp => Some(MouseAction::ScrollUp(col, row)),
         MouseEventKind::ScrollDown => Some(MouseAction::ScrollDown(col, row)),
+        MouseEventKind::Down(MouseButton::Right) => Some(MouseAction::RightDown(col, row)),
         _ => None,
     }
 }
@@ -514,6 +515,10 @@ mod tests {
         // Right button and hover moves stay keyboard-only.
         assert_eq!(
             map_mouse(MouseEventKind::Down(MouseButton::Right), 3, 4),
+            Some(MouseAction::RightDown(3, 4))
+        );
+        assert_eq!(
+            map_mouse(MouseEventKind::Down(MouseButton::Middle), 3, 4),
             None
         );
         assert_eq!(map_mouse(MouseEventKind::Moved, 3, 4), None);

@@ -22,6 +22,8 @@ pub enum MouseAction {
     ScrollUp(u16, u16),
     /// Wheel-down at screen cell `(col, row)`.
     ScrollDown(u16, u16),
+    /// Right-press at screen cell `(col, row)`: context menu.
+    RightDown(u16, u16),
 }
 
 pub struct Workspace {
@@ -467,8 +469,17 @@ impl Workspace {
         }
         // The project browser needs workspace-level opens.
         if self.current().mode() == Mode::OpenProject {
-            if let MouseAction::Down(_, row) = action {
-                self.click_browser(row);
+            match action {
+                MouseAction::Down(col, row) => {
+                    if self.current_mut().click_popup(col, row) {
+                        self.replay_click_keys();
+                    } else {
+                        self.click_browser(col, row);
+                    }
+                }
+                MouseAction::ScrollUp(..) => self.on_key_browser(KeyCode::Up),
+                MouseAction::ScrollDown(..) => self.on_key_browser(KeyCode::Down),
+                _ => {}
             }
             return;
         }
@@ -478,6 +489,7 @@ impl Workspace {
             MouseAction::Up => self.current_mut().on_mouse_up(),
             MouseAction::ScrollUp(col, row) => self.current_mut().on_wheel(col, row, true),
             MouseAction::ScrollDown(col, row) => self.current_mut().on_wheel(col, row, false),
+            MouseAction::RightDown(col, row) => self.current_mut().on_right_click(col, row),
         }
         self.replay_click_keys();
         self.sync_theme();
@@ -486,11 +498,12 @@ impl Workspace {
 
     /// Click a project-browser row: select it, or activate it when it is
     /// already selected (mouse double-click without a timer).
-    fn click_browser(&mut self, row: u16) {
+    fn click_browser(&mut self, col: u16, row: u16) {
+        let double = self.current_mut().note_click(col, row);
         let Some(idx) = self.current().browser_hit_at(row) else {
             return;
         };
-        if idx == self.current().browser_selected_index() {
+        if idx == self.current().browser_selected_index() && double {
             self.open_selected();
         } else {
             self.current_mut().set_browser_selected(idx);

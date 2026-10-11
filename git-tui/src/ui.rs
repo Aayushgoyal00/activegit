@@ -307,7 +307,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::ConfirmPush => render_confirm_push_modal(frame, area, app),
         Mode::LlmSettings => render_llm_modal(frame, area, app),
         Mode::ThemePicker => render_theme_modal(frame, area, app),
-        Mode::ActionMenu => render_action_menu(frame, area, app),
+        Mode::ActionMenu => {
+            if app.menu_return() == Mode::FullDiff {
+                render_fullscreen_diff(frame, area, app);
+            }
+            render_action_menu(frame, area, app);
+        }
         Mode::Confirm => {
             if app.confirm_back() == Mode::FullDiff {
                 render_fullscreen_diff(frame, area, app);
@@ -382,7 +387,12 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
         Mode::ConfirmPush => render_confirm_push_modal(frame, body, app),
         Mode::LlmSettings => render_llm_modal(frame, body, app),
         Mode::ThemePicker => render_theme_modal(frame, body, app),
-        Mode::ActionMenu => render_action_menu(frame, body, app),
+        Mode::ActionMenu => {
+            if app.menu_return() == Mode::FullDiff {
+                render_fullscreen_diff(frame, body, app);
+            }
+            render_action_menu(frame, body, app);
+        }
         Mode::Confirm => {
             if app.confirm_back() == Mode::FullDiff {
                 render_fullscreen_diff(frame, body, app);
@@ -2330,6 +2340,7 @@ pub(crate) enum FooterAction {
     StashDrop,
     Theme,
     Menu,
+    Copy,
 }
 
 pub(crate) fn footer_buttons(app: &App) -> Vec<(&'static str, FooterAction)> {
@@ -2337,10 +2348,12 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<(&'static str, FooterAction)> {
     match app.mode() {
         Mode::FullDiff => vec![
             ("Stage hunk", StageHunk),
+            ("Copy", Copy),
             ("Close", CloseDiff),
             ("Find", Find),
             ("Pull", Pull),
             ("Push", Push),
+            ("Menu", Menu),
         ],
         Mode::Normal if app.focus() == Focus::Branches => vec![
             ("Checkout", Checkout),
@@ -2356,7 +2369,16 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<(&'static str, FooterAction)> {
         ],
         Mode::Normal if app.focus() == Focus::Diff => vec![
             ("Stage hunk", StageHunk),
+            ("Copy", Copy),
             ("Full screen", OpenDiff),
+            ("Find", Find),
+            ("Menu", Menu),
+        ],
+        // Nothing in the commits list can be staged: no dead buttons.
+        Mode::Normal if app.focus() == Focus::Log => vec![
+            ("Commit", Commit),
+            ("Pull", Pull),
+            ("Push", Push),
             ("Find", Find),
             ("Menu", Menu),
         ],
