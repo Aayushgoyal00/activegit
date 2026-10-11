@@ -482,7 +482,7 @@ const PALETTES: &[(&str, Palette)] = &[
 pub struct Config {
     pub keys: KeyBindings,
     pub theme: Theme,
-    /// LLM provider for Shift+A commit generation in the commit box.
+    /// LLM provider for Ctrl+G commit generation in the commit box.
     /// `~/.config/activegit/config.toml` `[llm]` section; empty key falls
     /// back to `$OPENAI_API_KEY` / `$ANTHROPIC_API_KEY` / `$GEMINI_API_KEY`
     /// / `$OPENROUTER_API_KEY` / `$LLM_API_KEY` at generation time.

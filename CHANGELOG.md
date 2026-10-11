@@ -5,28 +5,82 @@ built from these entries by cargo-dist.
 
 ## Unreleased
 
-### Actions menu
+### Safety
 
-- **`?` / `[Menu]`**: a searchable list of every action for the focused
-  panel, grouped, with each action's key. Type to filter, `enter` runs.
-- **Safer button bar**: actions that throw work away (discard, restore
-  hunk, delete branch, drop stash) left the clickable bottom bar. They
-  are in the menu and ask for a second `enter` naming the target. Their
-  keys are unchanged.
+- **Confirm before anything is thrown away**: discard (file or folder),
+  restore hunk, delete branch, drop stash, force push and abort merge go
+  through one confirm box that names the target. It applies to the keys
+  (`d`, `x`, `D`) as well as the buttons and menu. `[ui]
+  confirm_destructive = false` turns it off.
+- **Undo** (`u`): puts back the last discard, untracked files included.
+- **Ctrl/Alt are no longer ignored**: `ctrl+d` used to discard, `ctrl+x`
+  to restore a hunk, `ctrl+p` to pull. Modified keys are now their own
+  shortcuts (see below) or do nothing.
+- **Paste is text**: a multi-line paste into the commit box used to commit
+  at the first line break and run the rest as commands. Pastes now only
+  ever fill the open text box, on terminals with and without bracketed
+  paste.
+- **The commit message survives**: closing the box keeps it, and a failed
+  commit reopens the box with it. A generated message no longer overwrites
+  text typed while it was generating.
+- **Capital `A` can be typed in the commit box.** Message generation
+  moved from `Shift+A` to `Ctrl+G`.
 
-### Themes
+### Fixes
 
-- **11 new themes**: `gruvbox`, `dracula`, `nord`, `one-dark`, `kanagawa`,
-  `everforest`, `solarized-dark`, `github-dark`, and the light `one-light`,
-  `gruvbox-light`, `github-light`.
-- **Theme picker** (`T` / `[Theme]`): live preview while moving through
-  the list; `enter` saves `[theme] name` to the config.
+- **Branch checkout** changed the branch name but left the previous
+  branch's files in place when the two had diverged.
+- **Staging or restoring a single hunk** rewrote the whole file: CRLF
+  line endings became LF and non-UTF-8 bytes were replaced.
+- **Commits** now run through `git commit`, so pre-commit / commit-msg
+  hooks run, `commit.gpgsign` is honored, and committing during a merge
+  makes a merge commit.
+- **Discarding `a[1].txt` also restored `a1.txt`** (and similar glob
+  matches); paths are now matched literally.
+- **A conflicted pull** showed no useful message; it now lists the
+  conflicts, the merge state is shown, and it can be continued or aborted.
+- **ssh**: `core.sshCommand` and `GIT_SSH` are respected (they were
+  overridden, which broke the Windows OpenSSH agent and per-repo keys).
+- **Push** goes to the tracked branch even when it has another name, and
+  is refused on a detached HEAD instead of pushing `(detached HEAD)`.
+- Staging a deleted file, staged renames, `q` in the fullscreen diff
+  (closes the diff, not the project), a crash on long non-ASCII paths in
+  the project browser, and errors being wiped before they could be read.
 
-### Responsiveness
+### Mouse
 
-- Results from background git work are drawn as soon as they land instead
-  of up to 100ms later (per step; staging chains three). On Windows a key
-  release no longer restarts that wait.
+- The wheel scrolls what is under the pointer (diffs, lists, menus)
+  without changing focus. Double-click opens; one click only selects.
+- Right-click opens the actions menu for what is under the pointer.
+- Drag in a diff to select lines, then `y` or `[Copy]`.
+- Every popup has clickable buttons and closes on a click outside.
+- Click a folder's arrow to fold it. `[ui] mouse = false` gives the mouse
+  back to the terminal.
+
+### Keyboard
+
+- `g` / `G` first / last; `ctrl+d` / `ctrl+u` half page; PgUp / PgDn page
+  by what is on screen; `shift+tab` cycles panels backwards.
+- `ctrl+f` searches the open diff, `n` / `N` step through matches.
+- `]` / `[` in the fullscreen diff step through files.
+- `F1`: every key on one screen, in your own bindings.
+- Text boxes: `ctrl+w`, `ctrl+u`, `ctrl+k`, `ctrl+a`, `ctrl+e`, word
+  movement, `alt+enter` for a new line in the commit box.
+- Staging a hunk keeps your place instead of jumping to the top.
+
+### Features
+
+- **Fetch** (`f`), **amend last commit** and **force push with lease**
+  (menu).
+- **Open a commit**: `enter` on a commit shows what it changed, file by
+  file. `L` loads more history.
+- **Staged side** (`S`): view what is already staged in a partly staged
+  file.
+- **Actions menu** (`?` / `[Menu]`), also from the fullscreen diff.
+- **Themes**: 11 new ones, and a live picker (`T`).
+- Push, pull and LLM calls no longer block status, diffs and staging.
+  Returning to the terminal, switching tabs and `r` refresh everything.
+- Saving settings from the app keeps the comments in your config file.
 
 ## v0.2.3 - 2026-10-06
 

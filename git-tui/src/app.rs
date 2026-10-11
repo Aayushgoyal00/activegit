@@ -185,10 +185,10 @@ pub struct App {
     queue: JobQueue,
     keys: KeyBindings,
     theme: Theme,
-    /// LLM provider config for Shift+A commit generation.
+    /// LLM provider config for Ctrl+G commit generation.
     llm: LlmConfig,
     /// A GenerateCommitMessage job is in flight ("generating…" in the
-    /// commit modal). Set on Shift+A, cleared when the message or an
+    /// commit modal). Set on Ctrl+G, cleared when the message or an
     /// error arrives via `poll`.
     generating: bool,
     /// One-line success confirmation (e.g. "LLM settings saved"), shown
@@ -2006,7 +2006,7 @@ impl App {
         }
     }
 
-    /// Shift+A in the commit box: reference every staged file (index vs
+    /// Ctrl+G in the commit box: reference every staged file (index vs
     /// HEAD) and ask the LLM provider for a Conventional-Commits message.
     /// The result arrives via `poll` as `GeneratedMessage` and replaces
     /// the draft (cursor jumps to the end for quick editing).
@@ -2116,15 +2116,12 @@ impl App {
         }
     }
 
-    /// Dispatch a keypress (event loop calls this; then [`App::poll`]).
-    /// Test/legacy path with no modifiers: `A` is treated as Shift+A so
-    /// tests can drive generation with a single KeyCode. The binary uses
-    /// [`Self::on_key_with_modifiers`].
+    /// Dispatch a keypress with no modifier information (tests and simple
+    /// drivers). An uppercase letter is taken as typed with Shift. The
+    /// binary uses [`Self::on_key_with_modifiers`].
     #[allow(dead_code)]
     pub fn on_key(&mut self, key: KeyCode) {
-        // Test/legacy path: no modifiers known. `A` is treated as Shift+A
-        // so tests can drive generation with a single KeyCode.
-        let shift = matches!(key, KeyCode::Char('A'));
+        let shift = matches!(key, KeyCode::Char(c) if c.is_ascii_uppercase());
         self.on_key_with_modifiers(key, shift);
     }
 
@@ -2743,7 +2740,7 @@ impl App {
             return;
         }
         if self.mode == Mode::LlmSettings {
-            // Shift+A must not leak generation in here: the form owns every
+            // Nothing else may leak in here: the form owns every
             // key until Enter saves or Esc cancels.
             self.on_key_llm_settings(key);
             return;

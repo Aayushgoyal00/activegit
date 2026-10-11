@@ -560,8 +560,8 @@ impl Workspace {
         self.on_key_with_modifiers(key, shift);
     }
 
-    /// Modifier-aware dispatch: Shift+A inside the commit box generates a
-    /// commit message; everywhere else behaves like [`Self::on_key`].
+    /// Modifier-aware dispatch (Shift matters for Shift+arrows); keys
+    /// pressed with Ctrl or Alt arrive through [`Self::on_chord`].
     pub fn on_key_with_modifiers(&mut self, key: KeyCode, shift_held: bool) {
         // The welcome overlay owns every key until dismissed.
         if self.show_welcome {

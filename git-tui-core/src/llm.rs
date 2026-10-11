@@ -479,7 +479,7 @@ pub fn generate_commit_message(
     let files = staged_context(repo)?;
     if files.is_empty() {
         return Err(GitError::Llm(
-            "nothing staged: press space on a file to stage it, then Shift+A to generate".into(),
+            "nothing staged: press space on a file to stage it, then Ctrl+G to generate".into(),
         ));
     }
     if !config.is_configured() {

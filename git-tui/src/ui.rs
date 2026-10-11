@@ -2878,7 +2878,7 @@ fn render_action_menu(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Commit modal title: shows the generating state while the LLM call is
-/// in flight so Shift+A has visible feedback. The Shift+A hint lives in
+/// in flight so Ctrl+G has visible feedback. The Ctrl+G hint lives in
 /// the footer (and the empty-state placeholder), not the title.
 fn commit_title(app: &App) -> &'static str {
     if app.is_generating() {
@@ -4803,8 +4803,8 @@ mod tests {
             "empty-state placeholder missing:\n{s}"
         );
         assert!(
-            !s.contains("(Shift+A generates)"),
-            "title should not carry the permanent Shift+A hint:\n{s}"
+            !s.contains("(Ctrl+G generates)"),
+            "title should not carry the permanent Ctrl+G hint:\n{s}"
         );
     }
 
