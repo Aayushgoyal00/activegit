@@ -47,6 +47,8 @@ pub const ACTIONS: &[&str] = &[
     "toggle_markdown_preview",
     "theme_picker",
     "action_menu",
+    "sync_fetch",
+    "undo",
 ];
 
 /// Key names accepted in `[keys]` besides single characters.
@@ -112,6 +114,10 @@ pub struct KeyBindings {
     pub theme_picker: Vec<KeyCode>,
     /// Opens the actions menu (`?`).
     pub action_menu: Vec<KeyCode>,
+    /// `git fetch` (`f`).
+    pub sync_fetch: Vec<KeyCode>,
+    /// Put back what the last discard threw away (`u`).
+    pub undo: Vec<KeyCode>,
 }
 
 impl Default for KeyBindings {
@@ -151,6 +157,8 @@ impl Default for KeyBindings {
             toggle_markdown_preview: vec![Char('m')],
             theme_picker: vec![Char('T')],
             action_menu: vec![Char('?')],
+            sync_fetch: vec![Char('f')],
+            undo: vec![Char('u')],
         }
     }
 }
@@ -728,6 +736,8 @@ impl Config {
                 "toggle_markdown_preview" => k.toggle_markdown_preview = keys,
                 "theme_picker" => k.theme_picker = keys,
                 "action_menu" => k.action_menu = keys,
+                "sync_fetch" => k.sync_fetch = keys,
+                "undo" => k.undo = keys,
                 _ => anyhow::bail!(
                     "unknown action [{action}] (expected one of: {})",
                     ACTIONS.join(", ")

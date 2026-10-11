@@ -72,6 +72,11 @@ pub enum Mode {
     /// Yes/no box before an action that throws work away (see
     /// [`Danger`]). Enter or `y` runs it, Esc or `n` backs out.
     Confirm,
+    /// Every key on one scrollable screen (`F1`).
+    Help,
+    /// Typing a search for the open diff (`Ctrl+F`); Enter jumps to the
+    /// first match, then `n` / `N` step through them.
+    SearchDiff,
 }
 
 /// What kind of job a pending result belongs to, so a failure can be
@@ -352,6 +357,17 @@ pub struct App {
     /// begun selecting (it only does once the pointer leaves that row).
     drag_anchor: Option<usize>,
     drag_selecting: bool,
+    /// First line shown on the help screen, and the view it was opened
+    /// over.
+    help_scroll: Cell<usize>,
+    help_return: Mode,
+    /// Last diff search (lowercased), kept so `n` / `N` keep working, and
+    /// the view the search box was opened over.
+    search: Option<String>,
+    search_return: Mode,
+    /// After staging or restoring a hunk the diff reloads from the top:
+    /// this is the `(path, hunk)` to go back to once it has.
+    hunk_after_reload: Option<(String, usize)>,
     /// Kind of each job still waiting for its result.
     inflight: HashMap<JobId, Pending>,
     /// The error line came from a failed job: the status refresh that
@@ -735,6 +751,11 @@ impl App {
             double_click: false,
             drag_anchor: None,
             drag_selecting: false,
+            help_scroll: Cell::new(0),
+            help_return: Mode::Normal,
+            search: None,
+            search_return: Mode::Normal,
+            hunk_after_reload: None,
             inflight: HashMap::new(),
             error_sticky: false,
             commit_stash: String::new(),
@@ -1269,6 +1290,7 @@ impl App {
             }
             MenuAction::Footer(action) => self.click_footer_button(action),
             MenuAction::Refresh => self.refresh_all(),
+            MenuAction::Help => self.begin_help(),
             MenuAction::MarkdownPreview => self.toggle_markdown_preview(),
             MenuAction::LlmSettings => self.begin_llm_settings(),
             MenuAction::Focus(focus) => {
@@ -2053,7 +2075,7 @@ impl App {
         // Shift+Right in the file list jumps to the right-side diff
         // preview (plain Right expands folders, so it must stay put).
         if self.mode == Mode::Normal
-            && self.focus == Focus::Status
+            && self.focus != Focus::Diff
             && key == KeyCode::Right
             && shift_held
         {
@@ -2090,6 +2112,7 @@ impl App {
                 | Mode::FindFile
                 | Mode::LlmSettings
                 | Mode::ActionMenu
+                | Mode::SearchDiff
         )
     }
 
@@ -2113,9 +2136,246 @@ impl App {
                 Chord::Ctrl('l') if self.mode == Mode::Normal => self.refresh_all(),
                 Chord::Ctrl('d') => self.page(1, true),
                 Chord::Ctrl('u') => self.page(-1, true),
+                Chord::Ctrl('f') => self.begin_search(),
+                _ => {}
+            }
+        } else if self.mode == Mode::Help {
+            match chord {
+                Chord::Ctrl('d') => self.help_scroll_by(10),
+                Chord::Ctrl('u') => self.help_scroll_by(-10),
                 _ => {}
             }
         }
+    }
+
+    // ---- help screen ----
+
+    /// `F1`: every key on one screen.
+    pub fn begin_help(&mut self) {
+        if !matches!(self.mode, Mode::Normal | Mode::FullDiff) {
+            return;
+        }
+        self.help_return = self.mode;
+        self.help_scroll.set(0);
+        self.mode = Mode::Help;
+    }
+
+    /// The view the help screen was opened over.
+    pub fn help_return(&self) -> Mode {
+        self.help_return
+    }
+
+    fn help_scroll_by(&mut self, delta: isize) {
+        let next = (self.help_scroll.get() as isize)
+            .saturating_add(delta)
+            .max(0);
+        self.help_scroll.set(next as usize);
+    }
+
+    /// First help line to show. Only the renderer knows how long the help
+    /// is, so it passes the last valid offset and the stored one is pulled
+    /// back to it: scrolling stops at the end instead of running past it.
+    pub(crate) fn clamp_help_scroll(&self, max: usize) -> usize {
+        let off = self.help_scroll.get().min(max);
+        self.help_scroll.set(off);
+        off
+    }
+
+    fn on_key_help(&mut self, key: KeyCode) {
+        let k = self.keys.clone();
+        if key == KeyCode::Esc
+            || key == KeyCode::F(1)
+            || key == KeyCode::Enter
+            || k.project_close.contains(&key)
+            || k.action_menu.contains(&key)
+        {
+            self.mode = self.help_return;
+        } else if k.nav_down.contains(&key) {
+            self.help_scroll_by(1);
+        } else if k.nav_up.contains(&key) {
+            self.help_scroll_by(-1);
+        } else if k.scroll_down.contains(&key) {
+            self.help_scroll_by(10);
+        } else if k.scroll_up.contains(&key) {
+            self.help_scroll_by(-10);
+        } else if key == KeyCode::Char('g') || key == KeyCode::Home {
+            self.help_scroll.set(0);
+        } else if key == KeyCode::Char('G') || key == KeyCode::End {
+            // The renderer pulls this back to the last page.
+            self.help_scroll.set(usize::MAX / 2);
+        }
+    }
+
+    // ---- search inside the diff ----
+
+    /// `Ctrl+F`: search the open diff.
+    fn begin_search(&mut self) {
+        if self.diff_rows.is_empty() || self.show_markdown_preview() {
+            self.error = Some("nothing to search: no diff is open".into());
+            return;
+        }
+        self.search_return = self.mode;
+        if self.mode == Mode::Normal {
+            self.focus = Focus::Diff;
+        }
+        self.mode = Mode::SearchDiff;
+        self.draft = self.search.clone().unwrap_or_default();
+        self.move_draft_end();
+    }
+
+    /// The view the search box was opened over.
+    pub fn search_return(&self) -> Mode {
+        self.search_return
+    }
+
+    /// Enter in the search box: remember the query and go to the first
+    /// match at or after the cursor.
+    fn submit_search(&mut self) {
+        let query = self.draft.trim().to_lowercase();
+        self.mode = self.search_return;
+        self.draft.clear();
+        self.draft_cursor = 0;
+        if query.is_empty() {
+            self.search = None;
+            return;
+        }
+        self.search = Some(query);
+        self.search_step(1, true);
+    }
+
+    /// Diff rows whose text contains the current query.
+    fn search_matches(&self) -> Vec<usize> {
+        let (Some(query), Some(diff)) = (self.search.as_deref(), self.diff.as_ref()) else {
+            return Vec::new();
+        };
+        self.diff_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| cursor_line_text(diff, row).to_lowercase().contains(query))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// `n` / `N`: next / previous match, wrapping. `inclusive` lets the
+    /// row under the cursor count (a fresh search starts where you are).
+    fn search_step(&mut self, direction: isize, inclusive: bool) {
+        if self.search.is_none() {
+            self.error = Some("no search yet: ctrl+f searches this diff".into());
+            return;
+        }
+        let matches = self.search_matches();
+        if matches.is_empty() {
+            self.error = Some(format!(
+                "no match for \"{}\"",
+                self.search.as_deref().unwrap_or_default()
+            ));
+            return;
+        }
+        let here = self.cursor;
+        let position = if direction > 0 {
+            matches
+                .iter()
+                .position(|&row| row > here || (inclusive && row == here))
+                .unwrap_or(0)
+        } else {
+            matches
+                .iter()
+                .rposition(|&row| row < here)
+                .unwrap_or(matches.len() - 1)
+        };
+        self.cursor = matches[position];
+        self.cursor_col = 0;
+        self.sync_hunk_to_cursor();
+        self.ensure_cursor_visible();
+        self.notice = Some(format!("match {} of {}", position + 1, matches.len()));
+    }
+
+    // ---- top / bottom, files in fullscreen ----
+
+    /// `g` / `G`: first or last row of the focused list, or the top or
+    /// bottom of the diff.
+    fn jump_to_end(&mut self, bottom: bool) {
+        if self.mode == Mode::FullDiff || self.focus == Focus::Diff {
+            if self.show_markdown_preview() {
+                self.diff_scroll = 0;
+                if bottom {
+                    self.scroll_diff_by(isize::from(i16::MAX));
+                }
+            } else if !self.diff_rows.is_empty() {
+                self.cursor = if bottom { self.diff_rows.len() - 1 } else { 0 };
+                self.sync_hunk_to_cursor();
+                self.ensure_cursor_visible();
+            }
+            return;
+        }
+        match self.focus {
+            Focus::Status => {
+                let target = {
+                    let rows = visible_file_rows(&self.file_list, |d| self.collapsed.contains(d));
+                    let row = if bottom { rows.last() } else { rows.first() };
+                    row.map(|row| match row {
+                        FileRow::File { index, .. } => (Some(*index), None),
+                        FileRow::Dir { path, .. } => (None, Some(path.to_string())),
+                    })
+                };
+                match target {
+                    Some((Some(index), _)) => {
+                        self.selected = index;
+                        self.dir_cursor = None;
+                        self.maybe_load_diff();
+                    }
+                    Some((_, Some(dir))) => {
+                        let collapsed = self.collapsed.contains(&dir);
+                        self.select_folder(&dir, collapsed);
+                    }
+                    _ => {}
+                }
+            }
+            Focus::Branches => {
+                self.branch_selected = if bottom {
+                    self.branch_count().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+            Focus::Log => {
+                self.log_selected = if bottom {
+                    self.log_count().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+            Focus::Stash => {
+                self.stash_selected = if bottom {
+                    self.stash_count().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+            Focus::Diff => {}
+        }
+    }
+
+    /// `]` / `[` in the fullscreen diff: the next / previous file, without
+    /// going back to the list. Folder rows are stepped over.
+    fn step_file_in_fullscreen(&mut self, down: bool) {
+        let before = self.selected;
+        // A step can land on a folder header; a handful more reach a file.
+        for _ in 0..64 {
+            let at = (self.selected, self.dir_cursor.clone());
+            self.step_tree(down);
+            if self.dir_cursor.is_none() && self.selected != before {
+                break;
+            }
+            if (self.selected, self.dir_cursor.clone()) == at {
+                break;
+            }
+        }
+        if self.selected == before {
+            self.dir_cursor = None;
+            self.notice = Some(if down { "last file" } else { "first file" }.into());
+        }
+        self.visual = None;
     }
 
     fn on_chord_text(&mut self, chord: Chord) {
@@ -2126,8 +2386,10 @@ impl App {
                 // In the commit box only the current line goes.
                 let start = self.draft[..byte].rfind('\n').map_or(0, |i| i + 1);
                 let removed = self.draft[start..byte].chars().count();
+                // Read the cursor first: it is clamped to the text length.
+                let cursor = self.draft_cursor();
                 self.draft.drain(start..byte);
-                self.draft_cursor = self.draft_cursor() - removed;
+                self.draft_cursor = cursor.saturating_sub(removed);
             }
             Chord::Ctrl('k') => {
                 let byte = self.draft_byte_index();
@@ -2266,9 +2528,20 @@ impl App {
         self.reload_after_change();
     }
 
-    /// Page the focused view: half a screen for Ctrl+D / Ctrl+U.
+    /// Page the focused view by what is on screen: a whole page for
+    /// PgUp/PgDn, half of one for Ctrl+D / Ctrl+U.
     fn page(&mut self, direction: isize, half: bool) {
-        let rows: isize = if half { 10 } else { 20 };
+        let view = if self.mode == Mode::FullDiff {
+            self.full_view_h.get()
+        } else {
+            self.prev_view_h.get()
+        };
+        // No frame drawn yet (or a tiny pane): the old fixed step.
+        let rows = match view {
+            0..=3 => 10,
+            h if half => (h / 2).max(1),
+            h => h - 1,
+        } as isize;
         let delta = direction * rows;
         if self.mode == Mode::FullDiff {
             self.move_cursor_or_scroll(delta);
@@ -2377,6 +2650,8 @@ impl App {
                 | Mode::Confirm
                 | Mode::ConfirmPush
                 | Mode::Committing
+                | Mode::Help
+                | Mode::SearchDiff
         );
         if outside && closes_on_outside {
             self.press(KeyCode::Esc);
@@ -2392,6 +2667,10 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n' | 'N' | 'q') => self.cancel_confirm(),
                 _ => {}
             }
+            return;
+        }
+        if self.mode == Mode::Help {
+            self.on_key_help(key);
             return;
         }
         if self.mode == Mode::LlmSettings {
@@ -2469,6 +2748,7 @@ impl App {
                     Mode::StashPush => self.submit_stash_push(),
                     Mode::SetUpstream => self.submit_push_upstream(),
                     Mode::SetRemote => self.submit_publish(),
+                    Mode::SearchDiff => self.submit_search(),
                     // FullDiff, FindFile, and ConfirmPush return before
                     // reaching here. OpenProject/ConfirmInit submit
                     // through `Workspace` (it owns all projects), so they
@@ -2483,7 +2763,8 @@ impl App {
                     | Mode::LlmSettings
                     | Mode::ThemePicker
                     | Mode::ActionMenu
-                    | Mode::Confirm => {}
+                    | Mode::Confirm
+                    | Mode::Help => {}
                 },
                 KeyCode::Esc => {
                     if self.mode == Mode::Committing {
@@ -2492,6 +2773,7 @@ impl App {
                     }
                     self.mode = match self.mode {
                         Mode::SetUpstream | Mode::SetRemote => self.sync_return,
+                        Mode::SearchDiff => self.search_return,
                         _ => Mode::Normal,
                     };
                     self.draft.clear();
@@ -2510,7 +2792,28 @@ impl App {
             return;
         }
         let k = self.keys.clone();
-        if k.focus_next.contains(&key) {
+        if key == KeyCode::F(1) {
+            self.begin_help();
+        } else if key == KeyCode::BackTab {
+            // Shift+Tab: the same cycle as Tab, backwards.
+            self.focus = match self.focus {
+                Focus::Status | Focus::Diff => Focus::Stash,
+                Focus::Branches => Focus::Status,
+                Focus::Log => Focus::Branches,
+                Focus::Stash => Focus::Log,
+            };
+            self.maybe_load_branches();
+            self.maybe_load_log();
+            self.maybe_load_stash();
+        } else if key == KeyCode::Char('g') || (key == KeyCode::Home && self.focus != Focus::Diff) {
+            self.jump_to_end(false);
+        } else if key == KeyCode::Char('G') || (key == KeyCode::End && self.focus != Focus::Diff) {
+            self.jump_to_end(true);
+        } else if key == KeyCode::Char('n') && self.focus == Focus::Diff {
+            self.search_step(1, false);
+        } else if key == KeyCode::Char('N') && self.focus == Focus::Diff {
+            self.search_step(-1, false);
+        } else if k.focus_next.contains(&key) {
             // Tab cycles the left rail only (Status -> Branches -> Log ->
             // Stash -> Status). The right-side Diff preview is reached via
             // `5` / Shift+Right, never via Tab; Tab from Diff drops back
@@ -2608,17 +2911,9 @@ impl App {
         } else if k.stash_drop.contains(&key) && self.focus == Focus::Stash {
             self.request_danger(Danger::DropStash);
         } else if k.scroll_up.contains(&key) {
-            if self.focus == Focus::Diff && !self.show_markdown_preview() {
-                self.move_cursor(-10);
-            } else {
-                self.scroll_diff_by(-10);
-            }
+            self.page(-1, false);
         } else if k.scroll_down.contains(&key) {
-            if self.focus == Focus::Diff && !self.show_markdown_preview() {
-                self.move_cursor(10);
-            } else {
-                self.scroll_diff_by(10);
-            }
+            self.page(1, false);
         } else if k.commit.contains(&key) {
             self.open_commit_box();
         } else if k.toggle_markdown_preview.contains(&key) {
@@ -2640,6 +2935,11 @@ impl App {
         } else if k.quit.contains(&key) {
             self.quit = true;
         }
+        // A selection belongs to the diff panel: leaving it drops it (it
+        // used to linger and swallow the next Esc).
+        if self.mode == Mode::Normal && self.focus != Focus::Diff {
+            self.visual = None;
+        }
     }
 
     /// Keys inside the fullscreen diff overlay. `j/k`/`↑`/`↓` move the
@@ -2660,6 +2960,20 @@ impl App {
             }
         } else if k.action_menu.contains(&key) {
             self.begin_action_menu();
+        } else if key == KeyCode::F(1) {
+            self.begin_help();
+        } else if key == KeyCode::Char(']') {
+            self.step_file_in_fullscreen(true);
+        } else if key == KeyCode::Char('[') {
+            self.step_file_in_fullscreen(false);
+        } else if key == KeyCode::Char('g') {
+            self.jump_to_end(false);
+        } else if key == KeyCode::Char('G') {
+            self.jump_to_end(true);
+        } else if key == KeyCode::Char('n') {
+            self.search_step(1, false);
+        } else if key == KeyCode::Char('N') {
+            self.search_step(-1, false);
         } else if k.toggle_markdown_preview.contains(&key) {
             self.toggle_markdown_preview();
         } else if k.find_files.contains(&key) {
@@ -2698,9 +3012,9 @@ impl App {
             self.visual = None;
             self.snap_scroll_to_cursor();
         } else if k.scroll_up.contains(&key) {
-            self.move_cursor_or_scroll(-10);
+            self.page(-1, false);
         } else if k.scroll_down.contains(&key) {
-            self.move_cursor_or_scroll(10);
+            self.page(1, false);
         } else if key == KeyCode::Char('J') && !self.show_markdown_preview() {
             self.select_hunk(self.hunk.saturating_add(1));
         } else if key == KeyCode::Char('K') && !self.show_markdown_preview() {
@@ -3231,6 +3545,7 @@ impl App {
                 let next = (self.theme_selected as isize + step).clamp(0, last);
                 return self.theme_picker_select(next as usize);
             }
+            Mode::Help => return self.help_scroll_by(step * 3),
             Mode::FullDiff => return self.wheel_diff(step * 3),
             Mode::Normal => {}
             _ => return,
@@ -4194,11 +4509,14 @@ impl App {
                 path,
                 hunk_index,
                 staged,
-            } => vec![AsyncJob::DiscardHunk {
-                path,
-                hunk_index,
-                staged,
-            }],
+            } => {
+                self.hunk_after_reload = Some((path.clone(), hunk_index));
+                vec![AsyncJob::DiscardHunk {
+                    path,
+                    hunk_index,
+                    staged,
+                }]
+            }
             DangerAction::DeleteBranch(name) => vec![AsyncJob::DeleteBranch { name }],
             DangerAction::DropStash(index) => vec![AsyncJob::StashDrop { index }],
         };
@@ -4271,6 +4589,8 @@ impl App {
             self.error = Some("nothing to stage in this hunk".into());
             return;
         }
+        // The next hunk takes this one's index once it is staged.
+        self.hunk_after_reload = Some((path.clone(), self.hunk));
         let job = AsyncJob::StageHunk {
             path,
             hunk_index: self.hunk,
@@ -4816,7 +5136,17 @@ impl App {
                             self.error = Some(e.to_string());
                         }
                     } else {
+                        let back_to = self
+                            .hunk_after_reload
+                            .take()
+                            .filter(|(path, _)| *path == d.path)
+                            .map(|(_, hunk)| hunk);
                         self.set_diff(Some(d));
+                        if let Some(hunk) = back_to {
+                            if self.hunk_count() > 0 {
+                                self.select_hunk(hunk);
+                            }
+                        }
                         self.sync_hunk_to_cursor();
                         if self.show_markdown_preview() {
                             // The fresh content may be shorter: keep the
@@ -4945,11 +5275,16 @@ impl App {
 /// that change which list comes back. The key itself is never included in
 /// the string beyond a yes/no, so nothing secret reaches logs or tests.
 fn llm_fetch_target(cfg: &LlmConfig) -> String {
+    use std::hash::{Hash, Hasher};
+    // A digest, so a different key is a different request without the key
+    // itself ever being part of the string.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cfg.effective_api_key().hash(&mut hasher);
     format!(
-        "{}|{}|{}",
+        "{}|{}|{:x}",
         cfg.provider,
         cfg.base_url.clone().unwrap_or_default(),
-        !cfg.effective_api_key().is_empty()
+        hasher.finish()
     )
 }
 
@@ -6953,13 +7288,25 @@ mod tests {
     fn page_keys_move_cursor_with_follow() {
         let mut fx = two_hunk_fixture();
         fx.app.on_key(KeyCode::Enter);
+        // A page is what is on screen (minus one line of overlap), not a
+        // fixed ten rows.
         fx.app.set_view_h_for_test(5, 5);
         fx.app.on_key(KeyCode::PageDown);
-        assert_eq!(fx.app.cursor_row(), 10);
+        assert_eq!(fx.app.cursor_row(), 4);
+        fx.app.on_key(KeyCode::PageDown);
+        fx.app.on_key(KeyCode::PageDown);
+        assert_eq!(fx.app.cursor_row(), 12);
         assert_eq!(fx.app.hunk(), 1, "crossed into the second hunk");
-        assert_eq!(fx.app.diff_scroll(), 6);
-        fx.app.on_key(KeyCode::PageUp);
+        assert_eq!(fx.app.diff_scroll(), 8);
+        for _ in 0..3 {
+            fx.app.on_key(KeyCode::PageUp);
+        }
         assert_eq!((fx.app.cursor_row(), fx.app.diff_scroll()), (0, 0));
+        // Ctrl+D / Ctrl+U move half a page.
+        fx.app.on_chord(Chord::Ctrl('d'));
+        assert_eq!(fx.app.cursor_row(), 2);
+        fx.app.on_chord(Chord::Ctrl('u'));
+        assert_eq!(fx.app.cursor_row(), 0);
     }
 
     #[test]
@@ -8620,5 +8967,185 @@ mod tests {
             .collect();
         assert!(!labels.contains(&"Stage"), "{labels:?}");
         assert!(labels.contains(&"Menu"));
+    }
+
+    // ---- keyboard navigation ----
+
+    #[test]
+    fn g_and_shift_g_jump_to_the_ends_of_lists_and_diffs() {
+        let mut fx = harness(&["a.txt", "b.txt", "c.txt"]);
+        fx.app.on_key(KeyCode::Char('G'));
+        assert_eq!(fx.app.selected_file().unwrap().path, "c.txt");
+        fx.app.on_key(KeyCode::Char('g'));
+        assert_eq!(fx.app.selected_file().unwrap().path, "a.txt");
+        fx.app.on_key(KeyCode::End);
+        assert_eq!(fx.app.selected_file().unwrap().path, "c.txt");
+        fx.app.on_key(KeyCode::Home);
+        assert_eq!(fx.app.selected_file().unwrap().path, "a.txt");
+
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.set_view_h_for_test(5, 5);
+        fx.app.on_key(KeyCode::Char('G'));
+        assert_eq!(fx.app.cursor_row(), fx.app.diff_rows.len() - 1);
+        assert_eq!(fx.app.hunk(), 1);
+        fx.app.on_key(KeyCode::Char('g'));
+        assert_eq!((fx.app.cursor_row(), fx.app.diff_scroll()), (0, 0));
+    }
+
+    #[test]
+    fn shift_tab_cycles_panels_backwards() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::BackTab);
+        assert_eq!(fx.app.focus(), Focus::Stash);
+        fx.app.on_key(KeyCode::BackTab);
+        assert_eq!(fx.app.focus(), Focus::Log);
+        fx.app.on_key(KeyCode::Tab);
+        assert_eq!(fx.app.focus(), Focus::Stash);
+        // Shift+Right reaches the diff from any rail panel.
+        fx.app.on_key_with_modifiers(KeyCode::Right, true);
+        assert_eq!(fx.app.focus(), Focus::Diff);
+    }
+
+    #[test]
+    fn search_in_diff_jumps_between_matches() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.set_view_h_for_test(8, 8);
+        fx.app.on_chord(Chord::Ctrl('f'));
+        assert_eq!(fx.app.mode(), Mode::SearchDiff);
+        for c in "CHANGED".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff, "back in the diff");
+        let first = fx.app.cursor_row();
+        let text =
+            |app: &App| cursor_line_text(app.diff().unwrap(), &app.diff_rows[app.cursor_row()]);
+        assert!(text(&fx.app).contains("CHANGED"), "cursor not on a match");
+        assert!(fx.app.notice().unwrap().starts_with("match 1 of "));
+        // `n` goes on, wrapping at the end; `N` comes back.
+        fx.app.on_key(KeyCode::Char('n'));
+        let second = fx.app.cursor_row();
+        assert!(second > first);
+        assert!(text(&fx.app).contains("CHANGED"));
+        fx.app.on_key(KeyCode::Char('N'));
+        assert_eq!(fx.app.cursor_row(), first);
+        fx.app.on_key(KeyCode::Char('N'));
+        assert!(fx.app.cursor_row() > first, "N wraps to the last match");
+        // Search is case-insensitive and reports a miss.
+        fx.app.on_chord(Chord::Ctrl('f'));
+        fx.app.on_chord(Chord::Ctrl('u'));
+        for c in "nothing-like-this".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.on_key(KeyCode::Enter);
+        assert!(fx.app.error().unwrap().contains("no match"));
+    }
+
+    #[test]
+    fn brackets_step_through_files_inside_the_fullscreen_diff() {
+        let mut fx = harness(&["a.txt", "b.txt", "c.txt"]);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        fx.app.on_key(KeyCode::Char(']'));
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        assert_eq!(fx.app.selected_file().unwrap().path, "b.txt");
+        wait_for_diff(&mut fx.app, "b.txt");
+        fx.app.on_key(KeyCode::Char(']'));
+        fx.app.on_key(KeyCode::Char(']'));
+        assert_eq!(fx.app.selected_file().unwrap().path, "c.txt");
+        assert_eq!(fx.app.notice(), Some("last file"));
+        fx.app.on_key(KeyCode::Char('['));
+        assert_eq!(fx.app.selected_file().unwrap().path, "b.txt");
+    }
+
+    #[test]
+    fn staging_a_hunk_keeps_your_place_in_the_diff() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.set_view_h_for_test(8, 8);
+        // Stage the first of two hunks: the remaining one is where the
+        // cursor should be, and with more hunks you would stay at the
+        // same index instead of being thrown back to the top.
+        fx.app.on_key(KeyCode::Char(' '));
+        wait_for(&mut fx.app, |st| {
+            st.files
+                .iter()
+                .any(|e| e.state == FileState::BothStagedAndUnstaged)
+        });
+        wait_for_diff(&mut fx.app, "a.txt");
+        assert_eq!(fx.app.diff().unwrap().hunks.len(), 1);
+        assert_eq!(fx.app.hunk(), 0);
+
+        // With three hunks, staging the second leaves you on the hunk
+        // that takes its place.
+        let (dir, repo) = init_repo();
+        let base = (1..=60).map(|i| format!("line {i}\n")).collect::<String>();
+        commit_file(&repo, "a.txt", &base, "init");
+        let dirty = base
+            .replacen("line 5\n", "line 5 X\n", 1)
+            .replacen("line 30\n", "line 30 X\n", 1)
+            .replacen("line 55\n", "line 55 X\n", 1);
+        let root = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(root.join("a.txt"), dirty).unwrap();
+        drop(repo);
+        let mut fx = Fixture {
+            _dir: dir,
+            app: App::new(JobQueue::spawn(root).unwrap()),
+        };
+        wait_for(&mut fx.app, |st| st.files.iter().any(|e| e.path == "a.txt"));
+        wait_for_diff(&mut fx.app, "a.txt");
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('J'));
+        assert_eq!(fx.app.hunk(), 1);
+        fx.app.on_key(KeyCode::Char(' '));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            fx.app.poll();
+            if fx.app.diff().is_some_and(|d| d.hunks.len() == 2) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "diff never reloaded");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(fx.app.hunk(), 1, "thrown back to the first hunk");
+        assert!(fx.app.cursor_row() > 0);
+    }
+
+    #[test]
+    fn help_screen_opens_scrolls_and_closes() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::F(1));
+        assert_eq!(fx.app.mode(), Mode::Help);
+        // Keys that act elsewhere only scroll or do nothing here.
+        fx.app.on_key(KeyCode::Char('d'));
+        fx.app.on_key(KeyCode::Char('j'));
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(fx.app.clamp_help_scroll(100), 2);
+        fx.app.on_key(KeyCode::Char('G'));
+        assert_eq!(fx.app.clamp_help_scroll(40), 40, "pulled back to the end");
+        fx.app.on_key(KeyCode::Char('k'));
+        assert_eq!(fx.app.clamp_help_scroll(40), 39);
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        // From the fullscreen diff it returns there.
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::F(1));
+        fx.app.on_key(KeyCode::Char('q'));
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+    }
+
+    #[test]
+    fn selection_does_not_outlive_leaving_the_diff_panel() {
+        let mut fx = two_hunk_fixture();
+        fx.app.on_key(KeyCode::Char('5'));
+        fx.app.on_key(KeyCode::Char('V'));
+        assert!(fx.app.visual().is_some());
+        fx.app.on_key(KeyCode::Char('1'));
+        assert!(
+            fx.app.visual().is_none(),
+            "selection lingered after leaving"
+        );
     }
 }

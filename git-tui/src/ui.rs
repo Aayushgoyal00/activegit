@@ -319,6 +319,18 @@ pub fn render(frame: &mut Frame, app: &App) {
             }
             render_confirm_modal(frame, area, app);
         }
+        Mode::Help => {
+            if app.help_return() == Mode::FullDiff {
+                render_fullscreen_diff(frame, area, app);
+            }
+            render_help_modal(frame, area, app);
+        }
+        Mode::SearchDiff => {
+            if app.search_return() == Mode::FullDiff {
+                render_fullscreen_diff(frame, area, app);
+            }
+            render_input_modal(frame, area, app, " Search in this diff ");
+        }
         Mode::FindFile => {
             // Opened fullscreen: keep the diff behind the modal.
             if app.finder_return() == Mode::FullDiff {
@@ -398,6 +410,18 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
                 render_fullscreen_diff(frame, body, app);
             }
             render_confirm_modal(frame, body, app);
+        }
+        Mode::Help => {
+            if app.help_return() == Mode::FullDiff {
+                render_fullscreen_diff(frame, body, app);
+            }
+            render_help_modal(frame, body, app);
+        }
+        Mode::SearchDiff => {
+            if app.search_return() == Mode::FullDiff {
+                render_fullscreen_diff(frame, body, app);
+            }
+            render_input_modal(frame, body, app, " Search in this diff ");
         }
         Mode::FindFile => {
             if app.finder_return() == Mode::FullDiff {
@@ -2271,30 +2295,34 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         Mode::SetUpstream => "←/→ move · Home/End jump · Del deletes · Enter push -u · Esc cancel",
         Mode::SetRemote => "←/→ move · Home/End jump · Del deletes · Enter add origin + push · Esc cancel",
         Mode::FullDiff => {
-            "j/k/↑/↓ line · h/l/←/→ col · J/K hunk · 0/Home/End · v/V select · y yank · space stage hunk · x restore hunk · d discard file · PgUp/PgDn page · m preview · / find · p pull · P push · esc leave/close · q close · Q quit"
+            "? menu · F1 keys · esc/q close · j/k line · J/K hunk · ]/[ file · space stage hunk · x restore · ctrl+f search · v/V select · y copy · g/G ends · PgUp/PgDn page"
         }
         Mode::Normal if app.focus() == Focus::Branches => {
-            "enter checkout · a new branch · D delete · tab commits · q close · Q quit"
+            "? menu · F1 keys · enter checkout · a new branch · D delete · g/G ends · tab commits · q close · Q quit"
         }
-        Mode::Normal if app.focus() == Focus::Log => "j/k select · tab stash · r refresh · q close · Q quit",
+        Mode::Normal if app.focus() == Focus::Log => {
+            "? menu · F1 keys · j/k select · enter open commit · L more · g/G ends · tab stash · q close · Q quit"
+        }
         Mode::Normal if app.focus() == Focus::Stash => {
-            "enter pop · a stash · D drop · tab files · q close · Q quit"
+            "? menu · F1 keys · enter pop · a stash · D drop · g/G ends · tab files · q close · Q quit"
         }
         Mode::Normal if app.focus() == Focus::Diff => {
-            "j/k/↑/↓ line · J/K hunk · h/l col · v/V select · y yank · space stage hunk · x restore hunk · PgUp/PgDn page · enter full screen · ←/1 files · tab files · q close · Q quit"
+            "? menu · F1 keys · j/k line · J/K hunk · space stage hunk · x restore · ctrl+f search · v/V select · y copy · g/G ends · enter full screen · ←/1 files"
         }
         Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
         Mode::LlmSettings => "tab/↑↓ switch field · ←/→ choose/edit · enter save · esc cancel",
         Mode::ThemePicker => "↑/↓ preview · enter keep + save · esc cancel",
         Mode::ActionMenu => "type to filter · ↑/↓ move · enter run · esc close",
         Mode::Confirm => "enter / y confirm · esc / n cancel",
+        Mode::Help => "j/k scroll · PgUp/PgDn page · g/G top/bottom · esc close",
+        Mode::SearchDiff => "enter search · then n / N next / previous · esc cancel",
         Mode::OpenProject => {
             "type to filter · ↑/↓ move · enter open/descend · → descend · ← up · tab jump to path · esc clear/close"
         }
         Mode::ConfirmInit => "enter git init here · esc back · any other key picks another folder",
         Mode::ConfirmPush => "enter push to upstream · esc cancel",
         Mode::Normal => {
-            "space stage file/dir · d discard · c commit · A llm · m preview · p pull · P push · / find · enter diff · Shift+→/5 · o open · r refresh · q close · Q quit"
+            "? menu · F1 keys · space stage · d discard · c commit · enter diff · / find · p pull · P push · f fetch · u undo · r refresh · q close · Q quit"
         }
     };
     let switch = if multi && app.mode() == Mode::Normal {
@@ -2469,6 +2497,61 @@ fn popup_buttons(frame: &mut Frame, app: &App, popup: Rect, buttons: &[(&str, Ui
 
 const OK: UiClick = UiClick::Key(KeyCode::Enter);
 const CANCEL: UiClick = UiClick::Key(KeyCode::Esc);
+
+/// Help screen (`F1`): every key, grouped, in the user's own bindings.
+/// Scrolls; the offset is clamped here because only the renderer knows
+/// how many lines fit.
+fn render_help_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
+    let sections = crate::menu::help_sections(app.keys());
+    let key_w = sections
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(key, _)| key.width()))
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (title, rows) in &sections {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(
+            (*title).to_string(),
+            Style::default()
+                .fg(theme.border_focused)
+                .add_modifier(Modifier::BOLD),
+        ));
+        for (key, what) in rows {
+            let pad = key_w.saturating_sub(key.width());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {key}{}  ", " ".repeat(pad)),
+                    Style::default()
+                        .fg(theme.branch_current)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled((*what).to_string(), Style::default().fg(theme.fg)),
+            ]));
+        }
+    }
+    let width = (key_w as u16 + 60).min(area.width.saturating_sub(2)).max(3);
+    let popup = centered_rect(area, width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let max = lines.len().saturating_sub(inner_h);
+    let off = app.clamp_help_scroll(max);
+    let title = if max == 0 {
+        " Keys ".to_string()
+    } else {
+        format!(" Keys ({}-{} of {}) ", off + 1, off + inner_h, lines.len())
+    };
+    let shown: Vec<Line<'static>> = lines.into_iter().skip(off).take(inner_h).collect();
+    frame.render_widget(
+        Paragraph::new(shown).block(panel_block(true, theme, title)),
+        popup,
+    );
+    popup_buttons(frame, app, popup, &[("Close", CANCEL)]);
+}
 
 /// Yes/no box before an action that throws work away. The question names
 /// exactly what will be affected.
@@ -6139,5 +6222,46 @@ mod tests {
         app.on_key(KeyCode::Up);
         let s = screen(&app, 100, 16);
         assert!(s.contains("> Quit"), "last entry not visible:\n{s}");
+    }
+
+    #[test]
+    fn help_screen_lists_keys_in_the_users_bindings() {
+        use crossterm::event::KeyCode;
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let mut config = crate::config::Config::default();
+        config.keys.commit = vec![KeyCode::Char('C')];
+        let mut app = App::new_with_config(JobQueue::spawn(dir.path()).unwrap(), config);
+        app.on_key(KeyCode::F(1));
+        let s = screen(&app, 120, 200);
+        assert!(s.contains("Keys"), "title missing:\n{s}");
+        for heading in ["Everywhere", "Files", "Text boxes", "Mouse"] {
+            assert!(s.contains(heading), "{heading} missing:\n{s}");
+        }
+        let commit = s.lines().find(|l| l.contains("commit box")).unwrap();
+        assert!(commit.contains(" C "), "rebound key not shown: {commit}");
+        // On a short terminal it scrolls instead of being cut off.
+        let s = screen(&app, 120, 20);
+        assert!(s.contains("of "), "no scroll position in the title:\n{s}");
+        assert!(s.contains("[Close]"));
+    }
+
+    #[test]
+    fn every_bound_action_appears_on_the_help_screen() {
+        let keys = crate::config::KeyBindings::default();
+        let text: String = crate::menu::help_sections(&keys)
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().map(|(key, what)| format!("{key} {what}\n")))
+            .collect();
+        // One spot check per group of bindings, so a new action cannot be
+        // added without a line of help.
+        for key in [
+            "?", "F1", "space", "d", "c", "p", "P", "f", "u", "T", "A", "o", "q", "Q", "/",
+        ] {
+            assert!(
+                text.lines().any(|l| l.split_whitespace().any(|w| w == key)),
+                "{key} missing from help"
+            );
+        }
     }
 }
