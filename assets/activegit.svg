@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- ActiveGit icon: a commit graph whose branch ends in the highlighted,
+       "active" commit. Same geometry as make_icon.py, which writes the
+       .png and .ico from it. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b2d42"/>
+      <stop offset="1" stop-color="#161622"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#tile)"/>
+  <circle cx="174" cy="92" r="41" fill="#a6e3a1" fill-opacity="0.22"/>
+  <path d="M174 92 V112 Q174 160 92 166" fill="none" stroke="#a6e3a1" stroke-width="18" stroke-linecap="round"/>
+  <path d="M92 60 V196" fill="none" stroke="#89b4fa" stroke-width="18" stroke-linecap="round"/>
+  <circle cx="92" cy="60" r="25" fill="#89b4fa"/>
+  <circle cx="92" cy="60" r="9.5" fill="#1e1e2e"/>
+  <circle cx="92" cy="196" r="25" fill="#89b4fa"/>
+  <circle cx="92" cy="196" r="9.5" fill="#1e1e2e"/>
+  <circle cx="174" cy="92" r="27" fill="#a6e3a1"/>
+</svg>

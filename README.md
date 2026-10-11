@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/activegit.png" alt="ActiveGit icon: a commit graph with one highlighted commit" width="96">
+
 # ActiveGit
 
 **A fast, keyboard-driven git TUI with AI commit messages**
@@ -138,6 +140,28 @@ unpack it, and put `activegit` (`activegit.exe` on Windows) somewhere on your `P
 On Windows, use a modern terminal such as **Windows Terminal**; the legacy
 console host has limited color and key support.
 
+### Start menu, desktop and taskbar (Windows)
+
+You do not have to open a terminal and type `activegit`. Run this once:
+
+```powershell
+activegit --shortcut
+```
+
+It adds **ActiveGit** to the Start menu and the desktop, with the app's
+icon. To keep it on the taskbar, right-click either one and choose **Pin
+to taskbar** (on Windows 11 it is under *Show more options*); Windows does
+not let a program pin itself.
+
+Clicking it opens a terminal window running ActiveGit with the projects
+you had open last time. The first time, when there is nothing to reopen,
+it asks which repository to open: type a path or drag a folder into the
+window.
+
+If Windows Terminal is your default terminal, the running window shows up
+on the taskbar under Windows Terminal's icon, next to the pinned ActiveGit
+icon; that is how Windows groups terminal windows.
+
 <details>
 <summary><b>Build from source</b> (Rust 1.88+)</summary>
 
@@ -164,6 +188,7 @@ activegit                                    # repo in the current directory
 activegit ~/projects/api ~/projects/web      # several repos as tabs
 activegit --repo ~/projects/api --theme tokyo-night
 activegit --version
+activegit --shortcut                         # Windows: Start menu + desktop shortcut
 ```
 
 ```text
@@ -173,7 +198,8 @@ usage: activegit [--theme <name>] [--no-welcome]
 
 `--` treats everything after it as paths; `--theme` overrides the config
 file for one run. With no paths, the last session's projects are reopened
-(falling back to the current directory).
+(falling back to the current directory). Started somewhere that is not a
+repository with nothing to reopen, it asks for one instead of failing.
 
 **First commit in 10 seconds:** `j`/`k` to pick a file → `space` to stage →
 `c` to open the commit box → type (or `Ctrl+G`) → `enter`.

@@ -5,6 +5,7 @@ mod input;
 mod markdown;
 mod menu;
 mod session;
+mod shortcut;
 mod syntax;
 mod ui;
 mod welcome;
@@ -28,12 +29,31 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use session::Session;
 use std::ffi::OsString;
-use std::io::stdout;
+use std::io::{stdout, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use workspace::Workspace;
 
 fn main() -> Result<()> {
+    let cli = parse_args(std::env::args_os().skip(1))?;
+    if cli.shortcut {
+        return shortcut::install();
+    }
+    let hold = cli.hold;
+    let result = start(cli);
+    if let (true, Err(e)) = (hold, &result) {
+        // Started from a shortcut: the window closes with the process, so
+        // the message would be gone before it could be read.
+        eprintln!("activegit: {e:#}");
+        eprintln!();
+        eprintln!("Press Enter to close.");
+        let _ = std::io::stdin().read_line(&mut String::new());
+        std::process::exit(1);
+    }
+    result
+}
+
+fn start(cli: Cli) -> Result<()> {
     // Stage 5 — raw mode, explained:
     // A terminal normally line-buffers input and echoes it (cooked mode):
     // your program only sees a line after Enter. A TUI needs every keypress
@@ -49,7 +69,6 @@ fn main() -> Result<()> {
     // Positional paths and `--repo` flags select the projects; empty means
     // restore the last session, falling back to the current directory.
     // Each path is resolved to its enclosing repo.
-    let cli = parse_args(std::env::args_os().skip(1))?;
     let mut config = Config::load().context("cannot load config")?;
     if let Some(name) = cli.theme {
         config.theme = Theme::by_name(&name).with_context(|| format!("unknown theme {name:?}"))?;
@@ -57,7 +76,18 @@ fn main() -> Result<()> {
     let has_explicit_paths = !cli.paths.is_empty();
     let no_welcome_flag = cli.no_welcome;
     let (paths, restored_current) = resolve_startup_paths(cli.paths);
-    let mut workspace = Workspace::open(paths, config)?;
+    let mut workspace = match Workspace::open(paths, config.clone()) {
+        Ok(workspace) => workspace,
+        // Started somewhere that is not a repository (a shortcut starts in
+        // the home folder) with nothing to restore: ask instead of failing.
+        Err(e) if !has_explicit_paths && std::io::stdin().is_terminal() => {
+            match ask_for_repository(&e.to_string())? {
+                Some(path) => Workspace::open(vec![path], config)?,
+                None => return Ok(()),
+            }
+        }
+        Err(e) => return Err(e),
+    };
     workspace.set_session_path(Session::default_path());
     // First-run welcome overlay: only when launched bare (no explicit
     // paths), interactive, and never seen before. Wrapper invocations
@@ -180,16 +210,87 @@ struct Cli {
     theme: Option<String>,
     paths: Vec<PathBuf>,
     no_welcome: bool,
+    /// `--shortcut`: create Start-menu / desktop shortcuts and exit.
+    shortcut: bool,
+    /// `--hold`: wait for Enter before closing after a startup error (the
+    /// shortcut passes it; its window would vanish with the message).
+    hold: bool,
 }
 
 const USAGE: &str =
-    "usage: activegit [--theme <name>] [--no-welcome] [--repo <path>]... [<path>...] [-- <path>...]";
+    "usage: activegit [--theme <name>] [--no-welcome] [--repo <path>]... [<path>...] [-- <path>...]
+       activegit --shortcut    add ActiveGit to the Start menu and desktop (Windows)";
+
+/// What a line typed at the "which repository?" prompt means.
+#[derive(Debug, PartialEq, Eq)]
+enum RepoAnswer {
+    Quit,
+    Open(PathBuf),
+    /// A folder that is not a repository yet: offer `git init`.
+    NotARepo(PathBuf),
+    Invalid(String),
+}
+
+fn read_repo_answer(line: &str) -> RepoAnswer {
+    // Paths dragged onto a terminal arrive wrapped in quotes.
+    let line = line.trim().trim_matches('"');
+    if line.is_empty() {
+        return RepoAnswer::Quit;
+    }
+    let path = match Repo::normalize_project_input(line) {
+        Ok(path) => path,
+        Err(e) => return RepoAnswer::Invalid(e.to_string()),
+    };
+    match Repo::discover_root(&path) {
+        Ok(root) => RepoAnswer::Open(root),
+        Err(_) if path.is_dir() => RepoAnswer::NotARepo(path),
+        Err(e) => RepoAnswer::Invalid(e.to_string()),
+    }
+}
+
+/// Plain prompt, before the TUI takes over the terminal: which repository
+/// to open. `None` means the user chose to quit.
+fn ask_for_repository(reason: &str) -> Result<Option<PathBuf>> {
+    let stdin = std::io::stdin();
+    let ask = |prompt: &str| -> Result<String> {
+        print!("{prompt}");
+        stdout().flush().ok();
+        let mut line = String::new();
+        stdin.read_line(&mut line).context("cannot read input")?;
+        Ok(line)
+    };
+    println!("ActiveGit");
+    println!();
+    println!("No repository to open yet ({reason}).");
+    println!("Type the path of a git repository (~ works, and you can drag a");
+    println!("folder into this window), or press Enter to quit.");
+    loop {
+        println!();
+        match read_repo_answer(&ask("> ")?) {
+            RepoAnswer::Quit => return Ok(None),
+            RepoAnswer::Open(path) => return Ok(Some(path)),
+            RepoAnswer::Invalid(message) => println!("{message}"),
+            RepoAnswer::NotARepo(path) => {
+                let answer = ask(&format!(
+                    "{} is not a git repository. Create one there? [y/N] ",
+                    path.display()
+                ))?;
+                if answer.trim().eq_ignore_ascii_case("y") {
+                    Repo::init(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    return Ok(Some(path));
+                }
+            }
+        }
+    }
+}
 
 fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli> {
     let mut cli = Cli {
         theme: None,
         paths: Vec::new(),
         no_welcome: false,
+        shortcut: false,
+        hold: false,
     };
     let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
@@ -206,6 +307,10 @@ fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli
             std::process::exit(0);
         } else if arg == "--no-welcome" {
             cli.no_welcome = true;
+        } else if arg == "--shortcut" {
+            cli.shortcut = true;
+        } else if arg == "--hold" {
+            cli.hold = true;
         } else if arg == "--theme" {
             let name = args.next().context("--theme needs a value")?;
             cli.theme = Some(
@@ -566,5 +671,43 @@ mod tests {
         let (paths, current) = resolve_from_session(&s);
         assert!(paths.is_empty());
         assert!(current.is_none());
+    }
+
+    #[test]
+    fn shortcut_and_hold_flags_parse() {
+        let cli = parse_args(args(&["--shortcut"])).unwrap();
+        assert!(cli.shortcut && !cli.hold);
+        let cli = parse_args(args(&["--hold"])).unwrap();
+        assert!(cli.hold && !cli.shortcut && cli.paths.is_empty());
+        assert!(!parse_args(args(&[])).unwrap().hold);
+    }
+
+    #[test]
+    fn repository_prompt_answers() {
+        assert_eq!(read_repo_answer(""), RepoAnswer::Quit);
+        assert_eq!(read_repo_answer("  \r\n"), RepoAnswer::Quit);
+        assert!(matches!(
+            read_repo_answer("/definitely/not/here-activegit-xyz"),
+            RepoAnswer::Invalid(_)
+        ));
+        let repo = tempfile::TempDir::new().unwrap();
+        init_repo(&repo);
+        let nested = repo.path().join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        // A folder inside a repository opens that repository; quotes from
+        // a drag-and-drop are fine.
+        let quoted = format!("\"{}\"\n", nested.display());
+        match read_repo_answer(&quoted) {
+            RepoAnswer::Open(root) => assert_eq!(
+                dunce::canonicalize(root).unwrap(),
+                dunce::canonicalize(repo.path()).unwrap()
+            ),
+            other => panic!("got {other:?}"),
+        }
+        let plain = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            read_repo_answer(&plain.path().display().to_string()),
+            RepoAnswer::NotARepo(plain.path().to_path_buf())
+        );
     }
 }

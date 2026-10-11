@@ -68,6 +68,16 @@ built from these entries by cargo-dist.
   movement, `alt+enter` for a new line in the commit box.
 - Staging a hunk keeps your place instead of jumping to the top.
 
+### Launching
+
+- **App icon**: `activegit.exe` has its own icon and name.
+- **`activegit --shortcut`** (Windows) adds ActiveGit to the Start menu and
+  the desktop, ready to pin to the taskbar: click it instead of opening a
+  terminal and typing.
+- Started outside a repository with no previous session, it asks which
+  repository to open (and offers `git init`) instead of exiting with an
+  error.
+
 ### Features
 
 - **Fetch** (`f`), **amend last commit** and **force push with lease**
