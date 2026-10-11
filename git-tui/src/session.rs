@@ -101,14 +101,8 @@ impl Session {
                 .collect(),
             current: self.current_clamped(),
         };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
         let text = toml::to_string_pretty(&file).context("cannot serialize session")?;
-        std::fs::write(path, text)
-            .with_context(|| format!("cannot write session {}", path.display()))?;
-        Ok(())
+        crate::config::write_atomic(path, &text)
     }
 
     /// Persist to the default path. No-op (Ok) when no path is known.

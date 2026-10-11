@@ -365,6 +365,14 @@ pub struct App {
     /// the view the search box was opened over.
     search: Option<String>,
     search_return: Mode,
+    /// Partly staged file whose staged half is shown instead of the
+    /// unstaged one (`S` flips). Tied to the path, so moving to another
+    /// file is back to the usual view.
+    staged_side_for: Option<String>,
+    /// How many commits the log panel asks for (`L` raises it).
+    log_limit: usize,
+    /// First line shown of the commit overview.
+    overview_scroll: Cell<usize>,
     /// After staging or restoring a hunk the diff reloads from the top:
     /// this is the `(path, hunk)` to go back to once it has.
     hunk_after_reload: Option<(String, usize)>,
@@ -755,6 +763,9 @@ impl App {
             help_return: Mode::Normal,
             search: None,
             search_return: Mode::Normal,
+            staged_side_for: None,
+            log_limit: Self::LOG_LIMIT,
+            overview_scroll: Cell::new(0),
             hunk_after_reload: None,
             inflight: HashMap::new(),
             error_sticky: false,
@@ -1110,6 +1121,16 @@ impl App {
     /// Active key bindings (the actions menu shows each action's key).
     pub(crate) fn keys(&self) -> &KeyBindings {
         &self.keys
+    }
+
+    /// The LLM settings in use (the setup form edits them in one tab).
+    pub fn llm(&self) -> &LlmConfig {
+        &self.llm
+    }
+
+    /// Apply LLM settings saved in another project tab.
+    pub fn set_llm(&mut self, llm: LlmConfig) {
+        self.llm = llm;
     }
 
     /// Apply a theme chosen in another project tab (the picker is global).
@@ -2545,6 +2566,9 @@ impl App {
         let delta = direction * rows;
         if self.mode == Mode::FullDiff {
             self.move_cursor_or_scroll(delta);
+        } else if self.focus == Focus::Log {
+            // The right side shows the selected commit, not a diff.
+            self.overview_scroll_by(delta);
         } else if self.focus == Focus::Diff && !self.show_markdown_preview() {
             self.move_cursor(delta);
         } else {
@@ -2809,6 +2833,10 @@ impl App {
             self.jump_to_end(false);
         } else if key == KeyCode::Char('G') || (key == KeyCode::End && self.focus != Focus::Diff) {
             self.jump_to_end(true);
+        } else if key == KeyCode::Char('S') {
+            self.toggle_staged_side();
+        } else if key == KeyCode::Char('L') && self.focus == Focus::Log {
+            self.load_more_log();
         } else if key == KeyCode::Char('n') && self.focus == Focus::Diff {
             self.search_step(1, false);
         } else if key == KeyCode::Char('N') && self.focus == Focus::Diff {
@@ -2970,6 +2998,8 @@ impl App {
             self.jump_to_end(false);
         } else if key == KeyCode::Char('G') {
             self.jump_to_end(true);
+        } else if key == KeyCode::Char('S') {
+            self.toggle_staged_side();
         } else if key == KeyCode::Char('n') {
             self.search_step(1, false);
         } else if key == KeyCode::Char('N') {
@@ -3564,8 +3594,12 @@ impl App {
         } else if mouse_in(col, row, layout.stash) {
             let last = self.stash_count().saturating_sub(1) as isize;
             self.stash_selected = (self.stash_selected as isize + step).clamp(0, last) as usize;
-        } else if mouse_in(col, row, layout.diff) && self.focus != Focus::Log {
-            self.wheel_diff(step * 3);
+        } else if mouse_in(col, row, layout.diff) {
+            if self.focus == Focus::Log {
+                self.overview_scroll_by(step * 3);
+            } else {
+                self.wheel_diff(step * 3);
+            }
         }
     }
 
@@ -4172,6 +4206,7 @@ impl App {
         }
         self.commit_overview_for = Some(commit.oid.clone());
         self.commit_overview = None;
+        self.overview_scroll.set(0);
         if let Err(e) = self.submit_job(AsyncJob::LoadCommitOverview { oid: commit.oid }) {
             self.error = Some(e.to_string());
         }
@@ -4605,7 +4640,40 @@ impl App {
     /// unstaged one.
     fn diff_target(&self) -> Option<(String, bool)> {
         let file = self.selected_file()?;
-        Some((file.path.clone(), file.state == FileState::Staged))
+        let staged = match file.state {
+            FileState::Staged => true,
+            // Both halves exist: the unstaged one unless `S` asked.
+            FileState::BothStagedAndUnstaged => {
+                self.staged_side_for.as_deref() == Some(file.path.as_str())
+            }
+            _ => false,
+        };
+        Some((file.path.clone(), staged))
+    }
+
+    /// `S`: flip between the staged and the unstaged half of a partly
+    /// staged file (the only kind that has both).
+    fn toggle_staged_side(&mut self) {
+        let Some(path) = self
+            .selected_file()
+            .filter(|f| f.state == FileState::BothStagedAndUnstaged)
+            .map(|f| f.path.clone())
+        else {
+            self.notice =
+                Some("only a partly staged file has a staged and an unstaged side".into());
+            return;
+        };
+        let showing_staged = self.staged_side_for.as_deref() == Some(path.as_str());
+        self.staged_side_for = if showing_staged { None } else { Some(path) };
+        self.notice = Some(
+            if !showing_staged {
+                "showing what is staged (S flips back, x unstages a hunk)"
+            } else {
+                "showing what is not staged yet"
+            }
+            .into(),
+        );
+        self.maybe_load_diff();
     }
 
     /// Whether the selected file needs a whole-file view (clean).
@@ -4721,14 +4789,46 @@ impl App {
         }
     }
 
-    /// History depth for the log panel.
+    /// History depth the log panel starts with.
     const LOG_LIMIT: usize = 100;
+
+    /// `L` in the commits panel: ask for more history.
+    fn load_more_log(&mut self) {
+        if self.log_count() < self.log_limit {
+            self.notice = Some(format!("that is all of it: {} commits", self.log_count()));
+            return;
+        }
+        self.log_limit += 400;
+        // Keep the list on screen while the longer one loads.
+        if let Err(e) = self.submit_job(AsyncJob::ListLog {
+            limit: self.log_limit,
+        }) {
+            self.error = Some(e.to_string());
+        } else {
+            self.notice = Some(format!("loading up to {} commits…", self.log_limit));
+        }
+    }
+
+    /// First line of the commit overview to show; the renderer passes the
+    /// last valid offset and the stored one is pulled back to it.
+    pub(crate) fn clamp_overview_scroll(&self, max: usize) -> usize {
+        let off = self.overview_scroll.get().min(max);
+        self.overview_scroll.set(off);
+        off
+    }
+
+    fn overview_scroll_by(&mut self, delta: isize) {
+        let next = (self.overview_scroll.get() as isize)
+            .saturating_add(delta)
+            .max(0);
+        self.overview_scroll.set(next as usize);
+    }
 
     /// Request history unless already loaded/loading.
     fn maybe_load_log(&mut self) {
         if self.focus == Focus::Log && self.log.is_none() {
             if let Err(e) = self.submit_job(AsyncJob::ListLog {
-                limit: Self::LOG_LIMIT,
+                limit: self.log_limit,
             }) {
                 self.error = Some(e.to_string());
             }
@@ -4739,7 +4839,7 @@ impl App {
         if self.log.is_some() {
             self.log = None;
             if let Err(e) = self.submit_job(AsyncJob::ListLog {
-                limit: Self::LOG_LIMIT,
+                limit: self.log_limit,
             }) {
                 self.error = Some(e.to_string());
             }
@@ -4886,6 +4986,11 @@ impl App {
             self.error = Some("still loading — try again in a moment".into());
             return;
         };
+        if branch.starts_with('(') {
+            self.error =
+                Some("nothing to push: HEAD is not on a branch (check one out first)".into());
+            return;
+        }
         let Some(sync) = self.sync.clone() else {
             self.reload_sync();
             self.error = Some("loading remotes — press P again in a moment".into());
@@ -9147,5 +9252,114 @@ mod tests {
             fx.app.visual().is_none(),
             "selection lingered after leaving"
         );
+    }
+
+    // ---- staged side, history, push guard ----
+
+    #[test]
+    fn shift_s_shows_the_staged_half_of_a_partly_staged_file() {
+        let mut fx = two_hunk_fixture();
+        // Not partly staged yet: nothing to flip.
+        fx.app.on_key(KeyCode::Char('S'));
+        assert!(fx.app.notice().unwrap().contains("partly staged"));
+        // Stage one of the two hunks.
+        fx.app.on_key(KeyCode::Char('5'));
+        fx.app.on_key(KeyCode::Char(' '));
+        wait_for(&mut fx.app, |st| {
+            st.files
+                .iter()
+                .any(|e| e.state == FileState::BothStagedAndUnstaged)
+        });
+        wait_for_diff(&mut fx.app, "a.txt");
+        assert!(!fx.app.diff_for.as_ref().unwrap().1, "unstaged by default");
+        let unstaged = fx.app.diff().unwrap().clone();
+        fx.app.on_key(KeyCode::Char('S'));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            fx.app.poll();
+            let staged_view = fx.app.diff_for.as_ref().is_some_and(|(_, staged)| *staged);
+            if staged_view && fx.app.diff().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "staged side never loaded");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(*fx.app.diff().unwrap(), unstaged, "same diff shown twice");
+        assert_eq!(fx.app.diff().unwrap().hunks.len(), 1);
+        // `x` on the staged side unstages the hunk: nothing is lost, so it
+        // does not ask.
+        fx.app.on_key(KeyCode::Char('x'));
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        wait_for(&mut fx.app, |st| {
+            st.files.iter().any(|e| e.state == FileState::Unstaged)
+        });
+    }
+
+    #[test]
+    fn staged_side_is_per_file() {
+        let (dir, repo) = init_repo();
+        let base = (1..=40).map(|i| format!("line {i}\n")).collect::<String>();
+        commit_file(&repo, "a.txt", &base, "init");
+        commit_file(&repo, "b.txt", &base, "init");
+        let root = repo.workdir().unwrap().to_path_buf();
+        let dirty =
+            base.replacen("line 5\n", "line 5 X\n", 1)
+                .replacen("line 35\n", "line 35 X\n", 1);
+        std::fs::write(root.join("a.txt"), &dirty).unwrap();
+        std::fs::write(root.join("b.txt"), &dirty).unwrap();
+        // Partly stage both from the outside.
+        git_tui_core::stage::stage_hunk(&repo, "a.txt", 0).unwrap();
+        git_tui_core::stage::stage_hunk(&repo, "b.txt", 0).unwrap();
+        drop(repo);
+        let mut fx = Fixture {
+            _dir: dir,
+            app: App::new(JobQueue::spawn(root).unwrap()),
+        };
+        wait_for(&mut fx.app, |st| st.files.len() == 2);
+        fx.app.on_key(KeyCode::Char('S'));
+        assert_eq!(fx.app.diff_target(), Some(("a.txt".into(), true)));
+        fx.app.on_key(KeyCode::Char('j'));
+        assert_eq!(
+            fx.app.diff_target(),
+            Some(("b.txt".into(), false)),
+            "the choice must not follow the cursor to another file"
+        );
+    }
+
+    #[test]
+    fn shift_l_asks_for_more_history_only_when_there_may_be_more() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('3'));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fx.app.log().is_none() {
+            fx.app.poll();
+            assert!(Instant::now() < deadline, "log never loaded");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // One commit in the fixture: the limit was not reached.
+        fx.app.on_key(KeyCode::Char('L'));
+        assert!(fx.app.notice().unwrap().contains("that is all of it"));
+        assert_eq!(fx.app.log_limit, App::LOG_LIMIT);
+    }
+
+    #[test]
+    fn pushing_from_a_detached_head_is_refused_with_a_reason() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        let first = repo.head().unwrap().target().unwrap();
+        commit_file(&repo, "a.txt", "two\n", "second");
+        repo.set_head_detached(first).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let root = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let mut fx = Fixture {
+            _dir: dir,
+            app: App::new(JobQueue::spawn(root).unwrap()),
+        };
+        wait_for(&mut fx.app, |st| st.branch.starts_with('('));
+        fx.app.on_key(KeyCode::Char('P'));
+        assert_eq!(fx.app.mode(), Mode::Normal, "no upstream prompt");
+        assert!(fx.app.error().unwrap().contains("not on a branch"));
     }
 }

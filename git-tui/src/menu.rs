@@ -343,7 +343,7 @@ pub(crate) fn help_sections(
                 (fixed("y"), "copy the selection"),
                 (bound(&keys.stage), "stage the hunk under the cursor"),
                 (fixed("x"), "restore the hunk (asks first)"),
-                (fixed("s"), "staged / unstaged side of a partly staged file"),
+                (fixed("S"), "staged / unstaged side of a partly staged file"),
             ],
         ),
         (

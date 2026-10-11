@@ -156,6 +156,15 @@ impl Workspace {
         if !self.apps.is_empty() {
             self.current = index.min(self.apps.len() - 1);
             self.save_session();
+            self.entered_tab();
+        }
+    }
+
+    /// A tab that was in the background may be out of date: nothing
+    /// refreshed it while another project was in front.
+    fn entered_tab(&mut self) {
+        if matches!(self.current().mode(), Mode::Normal | Mode::FullDiff) {
+            self.current_mut().refresh_quietly();
         }
     }
 
@@ -514,6 +523,7 @@ impl Workspace {
         if !self.apps.is_empty() {
             self.current = (self.current + 1) % self.apps.len();
             self.save_session();
+            self.entered_tab();
         }
     }
 
@@ -521,6 +531,7 @@ impl Workspace {
         if !self.apps.is_empty() {
             self.current = (self.current + self.apps.len() - 1) % self.apps.len();
             self.save_session();
+            self.entered_tab();
         }
     }
 
@@ -696,6 +707,15 @@ impl Workspace {
             self.config.theme = theme;
             for app in &mut self.apps {
                 app.set_theme(theme);
+            }
+        }
+        // Same for LLM settings saved from the setup form: every tab, and
+        // tabs opened later, use them without a restart.
+        if self.config.llm != *self.current().llm() {
+            self.config.llm = self.current().llm().clone();
+            let llm = self.config.llm.clone();
+            for app in &mut self.apps {
+                app.set_llm(llm.clone());
             }
         }
     }
@@ -1670,5 +1690,24 @@ mod tests {
         assert_eq!(ws.len(), 1);
         assert!(!ws.should_quit());
         assert_eq!(ws.current().mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn llm_settings_saved_in_one_tab_reach_the_others() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let b = init_repo_with_file("b", "b.txt", "b\n");
+        let mut ws = Workspace::open(
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            Config::default(),
+        )
+        .unwrap();
+        let mut llm = ws.current().llm().clone();
+        llm.provider = "ollama".into();
+        llm.model = "llama3".into();
+        ws.current_mut().set_llm(llm.clone());
+        // Any key runs the sync, as saving the form does.
+        ws.on_key(KeyCode::Esc);
+        assert!(ws.apps.iter().all(|app| *app.llm() == llm));
+        assert_eq!(ws.config.llm, llm, "tabs opened later get it too");
     }
 }

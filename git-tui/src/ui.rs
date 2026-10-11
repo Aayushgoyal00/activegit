@@ -3843,7 +3843,9 @@ fn render_commit_overview_panel(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
     let inner_h = area.height.saturating_sub(2) as usize;
-    let shown: Vec<Line<'static>> = lines.into_iter().take(inner_h.max(1)).collect();
+    // PgUp/PgDn and the wheel scroll a long message or file list.
+    let off = app.clamp_overview_scroll(lines.len().saturating_sub(inner_h.max(1)));
+    let shown: Vec<Line<'static>> = lines.into_iter().skip(off).take(inner_h.max(1)).collect();
     frame.render_widget(
         Paragraph::new(shown).block(panel_block(focused, theme, title)),
         area,
