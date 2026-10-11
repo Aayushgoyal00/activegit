@@ -39,12 +39,18 @@ pub fn repo_status(repo: &git2::Repository) -> Result<RepoStatus, GitError> {
     let branch = branch_name(repo)?;
     let head_summary = head_summary(repo)?;
 
+    // No rename detection: a staged rename is listed as what the index
+    // really holds, a deletion of the old path plus an addition of the
+    // new one. An entry here is just a path and a state, and stage /
+    // unstage / discard act on that one path; a paired-up rename would be
+    // reported under the old path (libgit2's choice), which no longer
+    // exists, while the new path looked clean.
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_ignored(false)
         .include_unmodified(false)
-        .renames_head_to_index(true);
+        .renames_head_to_index(false);
 
     let statuses = repo.statuses(Some(&mut opts))?;
     let mut files = Vec::with_capacity(statuses.len());
@@ -226,6 +232,56 @@ mod tests {
             "expected a.txt conflicted, got: {:?}",
             st.files
         );
+    }
+
+    /// `git mv old.txt new.txt`: move the file and stage both sides.
+    fn stage_rename(repo: &git2::Repository, from: &str, to: &str) {
+        let workdir = repo.workdir().unwrap();
+        fs::rename(workdir.join(from), workdir.join(to)).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new(from)).unwrap();
+        index.add_path(Path::new(to)).unwrap();
+        index.write().unwrap();
+    }
+
+    #[test]
+    fn staged_rename_is_reported_under_paths_that_can_be_acted_on() {
+        let (_dir, repo) = testutil::init_repo();
+        let body = (1..=20).map(|i| format!("line {i}\n")).collect::<String>();
+        testutil::commit_file(&repo, "old.txt", &body, "init");
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        stage_rename(&repo, "old.txt", "new.txt");
+
+        // The new path is listed as staged and is really there; the old
+        // one is listed as the staged deletion it is.
+        let st = repo_status(&repo).unwrap();
+        assert_eq!(state_of(&st, "new.txt"), Some(FileState::Staged));
+        assert!(workdir.join("new.txt").exists());
+        assert_eq!(state_of(&st, "old.txt"), Some(FileState::Staged));
+        assert_eq!(st.files.len(), 2, "got {:?}", st.files);
+
+        // Unstaging each reported entry works and undoes the staging.
+        for entry in &st.files {
+            crate::stage::unstage_file(&repo, &entry.path).unwrap();
+        }
+        let st = repo_status(&repo).unwrap();
+        assert_eq!(state_of(&st, "new.txt"), Some(FileState::Untracked));
+        assert_eq!(state_of(&st, "old.txt"), Some(FileState::Unstaged));
+
+        // Stage the rename again, then discard each reported entry: the
+        // repository is back to the commit.
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("old.txt")).unwrap();
+        index.add_path(Path::new("new.txt")).unwrap();
+        index.write().unwrap();
+        let st = repo_status(&repo).unwrap();
+        assert_eq!(st.files.len(), 2, "got {:?}", st.files);
+        for entry in &st.files {
+            crate::stage::discard_file(&repo, &entry.path).unwrap();
+        }
+        assert!(repo_status(&repo).unwrap().files.is_empty());
+        assert!(!workdir.join("new.txt").exists());
+        assert_eq!(fs::read_to_string(workdir.join("old.txt")).unwrap(), body);
     }
 
     #[test]

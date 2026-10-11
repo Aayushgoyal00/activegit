@@ -24,6 +24,11 @@ pub enum GitError {
     #[error("nothing to commit: index is empty")]
     EmptyCommit,
 
+    /// `git commit` itself failed; carries git's output (a rejecting
+    /// hook's message, a signing error, …).
+    #[error("commit failed: {0}")]
+    Commit(String),
+
     #[error("hunk staging failed: {0}")]
     HunkStaging(String),
 

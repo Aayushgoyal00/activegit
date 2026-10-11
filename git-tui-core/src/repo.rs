@@ -162,6 +162,42 @@ impl Repo {
         crate::commit::commit(&self.inner, message)
     }
 
+    /// Replace the HEAD commit with one made from the current index and
+    /// `message`.
+    pub fn amend(&self, message: &str) -> Result<git2::Oid, GitError> {
+        crate::commit::amend(&self.inner, message)
+    }
+
+    /// Full message of the HEAD commit, for prefilling an amend box.
+    pub fn last_commit_message(&self) -> Option<String> {
+        crate::commit::last_commit_message(&self.inner)
+    }
+
+    /// Which merge / rebase / cherry-pick / … is in progress, if any.
+    pub fn state(&self) -> RepoState {
+        repo_state(&self.inner)
+    }
+
+    /// Record `path` before a destructive action so it can be undone.
+    pub fn snapshot_path(&self, path: &str) -> Result<crate::stage::Snapshot, GitError> {
+        crate::stage::snapshot_path(&self.inner, path)
+    }
+
+    /// Undo a destructive action using a snapshot taken before it.
+    pub fn restore_snapshot(&self, snap: &crate::stage::Snapshot) -> Result<(), GitError> {
+        crate::stage::restore_snapshot(&self.inner, snap)
+    }
+
+    /// Paths changed by commit `oid`, in diff order.
+    pub fn commit_files(&self, oid: &str) -> Result<Vec<String>, GitError> {
+        diff::commit_files(&self.inner, oid)
+    }
+
+    /// Diff of `path` as changed by commit `oid`.
+    pub fn commit_file_diff(&self, oid: &str, path: &str) -> Result<FileDiff, GitError> {
+        diff::commit_file_diff(&self.inner, oid, path)
+    }
+
     pub fn list_branches(&self) -> Result<Vec<crate::branch::BranchInfo>, GitError> {
         crate::branch::list_branches(&self.inner)
     }
@@ -270,10 +306,85 @@ pub fn head_summary(repo: &git2::Repository) -> Result<String, GitError> {
     }
 }
 
+/// The multi-step operation a repository is in the middle of, if any.
+/// While one is in progress the TUI offers continue / abort instead of
+/// treating the leftover conflicts as ordinary changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoState {
+    /// Nothing in progress.
+    Clean,
+    /// A merge stopped before its commit (conflicts, or `--no-commit`).
+    Merge,
+    /// Any flavour of rebase (apply, merge or interactive backend).
+    Rebase,
+    /// A cherry-pick, single or part of a sequence.
+    CherryPick,
+    /// A revert, single or part of a sequence.
+    Revert,
+    Bisect,
+    /// Something else git tracks on disk (e.g. `git am`).
+    Other,
+}
+
+/// Which operation `repo` is in the middle of. A pure read of the
+/// marker files under `.git`, so it also sees operations started from a
+/// terminal.
+pub fn repo_state(repo: &git2::Repository) -> RepoState {
+    use git2::RepositoryState as S;
+    match repo.state() {
+        S::Clean => RepoState::Clean,
+        S::Merge => RepoState::Merge,
+        S::Rebase | S::RebaseInteractive | S::RebaseMerge => RepoState::Rebase,
+        S::CherryPick | S::CherryPickSequence => RepoState::CherryPick,
+        S::Revert | S::RevertSequence => RepoState::Revert,
+        S::Bisect => RepoState::Bisect,
+        S::ApplyMailbox | S::ApplyMailboxOrRebase => RepoState::Other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil;
+
+    #[test]
+    fn repo_state_reports_merge_in_progress() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        assert_eq!(repo_state(&repo), RepoState::Clean);
+
+        let (_dir, repo) = testutil::conflicted_merge();
+        assert_eq!(repo_state(&repo), RepoState::Merge);
+        assert_eq!(Repo::from_inner(repo).state(), RepoState::Merge);
+    }
+
+    #[test]
+    fn repo_state_maps_marker_files() {
+        // The other states are just files git leaves under `.git`.
+        let (_dir, repo) = testutil::init_repo();
+        let oid = testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        let git_dir = repo.path().to_path_buf();
+        let mark = |name: &str| std::fs::write(git_dir.join(name), format!("{oid}\n")).unwrap();
+        let unmark = |name: &str| std::fs::remove_file(git_dir.join(name)).unwrap();
+
+        mark("CHERRY_PICK_HEAD");
+        assert_eq!(repo_state(&repo), RepoState::CherryPick);
+        unmark("CHERRY_PICK_HEAD");
+
+        mark("REVERT_HEAD");
+        assert_eq!(repo_state(&repo), RepoState::Revert);
+        unmark("REVERT_HEAD");
+
+        mark("BISECT_LOG");
+        assert_eq!(repo_state(&repo), RepoState::Bisect);
+        unmark("BISECT_LOG");
+
+        std::fs::create_dir(git_dir.join("rebase-merge")).unwrap();
+        assert_eq!(repo_state(&repo), RepoState::Rebase);
+        std::fs::remove_dir(git_dir.join("rebase-merge")).unwrap();
+
+        assert_eq!(repo_state(&repo), RepoState::Clean);
+    }
 
     #[test]
     fn discovers_repo_from_nested_subdir() {

@@ -119,7 +119,10 @@ pub fn unstaged_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, Gi
         return untracked_file_diff(repo, path);
     }
     let mut opts = git2::DiffOptions::new();
-    opts.pathspec(path).context_lines(3);
+    // Literal path, not a glob: `a[1].txt` must not pull in `a1.txt`.
+    opts.pathspec(path)
+        .disable_pathspec_match(true)
+        .context_lines(3);
     let index = repo.index()?;
     let diff = repo.diff_index_to_workdir(Some(&index), Some(&mut opts))?;
     from_diff(&diff, path)
@@ -128,7 +131,9 @@ pub fn unstaged_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, Gi
 /// Index vs HEAD for `path`.
 pub fn staged_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, GitError> {
     let mut opts = git2::DiffOptions::new();
-    opts.pathspec(path).context_lines(3);
+    opts.pathspec(path)
+        .disable_pathspec_match(true)
+        .context_lines(3);
     let index = repo.index()?;
     let diff = match repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
         Some(tree) => repo.diff_tree_to_index(Some(&tree), Some(&index), Some(&mut opts))?,
@@ -137,12 +142,106 @@ pub fn staged_diff(repo: &git2::Repository, path: &str) -> Result<FileDiff, GitE
     from_diff(&diff, path)
 }
 
+/// Paths changed by commit `oid` (full hex id) relative to its first
+/// parent, or to the empty tree for a root commit, in diff order. A
+/// rename is listed once, under its new path; a deletion under the path
+/// that went away.
+pub fn commit_files(repo: &git2::Repository, oid: &str) -> Result<Vec<String>, GitError> {
+    let diff = commit_diff(repo, oid, &[])?;
+    let files = diff.deltas().map(|delta| delta_path(&delta)).collect();
+    Ok(files)
+}
+
+/// What commit `oid` (full hex id) did to `path`: the diff against its
+/// first parent, or against the empty tree for a root commit, in the
+/// same hunk format as [`unstaged_diff`]. `path` is a path as listed by
+/// [`commit_files`]; for a rename that is the new path, and the diff is
+/// taken against the old one, so only real edits show. A path the commit
+/// did not touch yields an empty diff.
+pub fn commit_file_diff(
+    repo: &git2::Repository,
+    oid: &str,
+    path: &str,
+) -> Result<FileDiff, GitError> {
+    // Find the file in the whole-commit diff first: a rename can only be
+    // paired up when both of its paths are in view.
+    let whole = commit_diff(repo, oid, &[])?;
+    let Some(delta) = whole.deltas().find(|delta| delta_path(delta) == path) else {
+        return Ok(FileDiff {
+            path: path.to_string(),
+            hunks: Vec::new(),
+            binary: false,
+        });
+    };
+    let old_path = delta
+        .old_file()
+        .path_bytes()
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .filter(|old| old != path);
+    let mut paths = vec![path];
+    paths.extend(old_path.as_deref());
+    let diff = commit_diff(repo, oid, &paths)?;
+    from_diff(&diff, path)
+}
+
+/// Diff of commit `oid` against its first parent (empty tree for a root
+/// commit), limited to `paths` when non-empty (literal paths, no
+/// globbing), with renames paired up.
+fn commit_diff<'repo>(
+    repo: &'repo git2::Repository,
+    oid: &str,
+    paths: &[&str],
+) -> Result<git2::Diff<'repo>, GitError> {
+    let parsed =
+        git2::Oid::from_str(oid).map_err(|e| GitError::Log(format!("bad commit id: {e}")))?;
+    let commit = repo
+        .find_commit(parsed)
+        .map_err(|e| GitError::Log(format!("cannot read commit: {e}")))?;
+    let tree = commit
+        .tree()
+        .map_err(|e| GitError::Log(format!("cannot read tree: {e}")))?;
+    let parent_tree = match commit.parents().next() {
+        Some(parent) => Some(
+            parent
+                .tree()
+                .map_err(|e| GitError::Log(format!("cannot read parent tree: {e}")))?,
+        ),
+        None => None,
+    };
+    let mut opts = git2::DiffOptions::new();
+    opts.context_lines(3).disable_pathspec_match(true);
+    for path in paths {
+        opts.pathspec(path);
+    }
+    let mut diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
+        .map_err(|e| GitError::Log(format!("cannot diff commit: {e}")))?;
+    // Explicit, so `diff.renames` in the user's config cannot change what
+    // a commit looks like here.
+    let mut find = git2::DiffFindOptions::new();
+    find.renames(true);
+    diff.find_similar(Some(&mut find))
+        .map_err(|e| GitError::Log(format!("cannot detect renames: {e}")))?;
+    Ok(diff)
+}
+
+/// The path a delta is listed under: the new side, falling back to the
+/// old one.
+fn delta_path(delta: &git2::DiffDelta<'_>) -> String {
+    delta
+        .new_file()
+        .path_bytes()
+        .or_else(|| delta.old_file().path_bytes())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .unwrap_or_default()
+}
+
 fn is_untracked(repo: &git2::Repository, path: &str) -> Result<bool, GitError> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(false)
         .include_ignored(false);
-    opts.pathspec(path);
+    opts.pathspec(path).disable_pathspec_match(true);
     let statuses = repo.statuses(Some(&mut opts))?;
     for entry in statuses.iter() {
         if entry.path() == Some(path) && entry.status().contains(git2::Status::WT_NEW) {
@@ -490,5 +589,176 @@ mod tests {
         testutil::dirty_file(&repo, "a.txt", "b\n");
         assert!(!unstaged_diff(&repo, "a.txt").unwrap().binary);
         assert!(!whole_file_diff(&repo, "a.txt").unwrap().binary);
+    }
+
+    #[test]
+    fn paths_with_glob_characters_are_taken_literally() {
+        // `a[1].txt` as a glob would match `a1.txt`.
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a[1].txt", "bracket\n", "init");
+        testutil::commit_file(&repo, "a1.txt", "plain\n", "second");
+        testutil::dirty_file(&repo, "a[1].txt", "bracket edit\n");
+        testutil::dirty_file(&repo, "a1.txt", "plain edit\n");
+
+        let d = unstaged_diff(&repo, "a[1].txt").unwrap();
+        assert_eq!(changes(&d), ["+bracket edit"]);
+        let d = unstaged_diff(&repo, "a1.txt").unwrap();
+        assert_eq!(changes(&d), ["+plain edit"]);
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a[1].txt")).unwrap();
+        index.add_path(Path::new("a1.txt")).unwrap();
+        index.write().unwrap();
+        let d = staged_diff(&repo, "a[1].txt").unwrap();
+        assert_eq!(changes(&d), ["+bracket edit"]);
+
+        // An untracked file with such a name is still recognised.
+        fs::write(repo.workdir().unwrap().join("b[1].txt"), "new\n").unwrap();
+        let d = unstaged_diff(&repo, "b[1].txt").unwrap();
+        assert_eq!(changes(&d), ["+new"]);
+
+        // Names the pattern syntax reads as a comment or a negation.
+        for name in ["#notes.txt", "!bang.txt", "my file.txt"] {
+            testutil::commit_file(&repo, name, "committed\n", "add");
+            testutil::dirty_file(&repo, name, "edited\n");
+            let d = unstaged_diff(&repo, name).unwrap();
+            assert_eq!(changes(&d), ["+edited"], "unstaged diff of {name}");
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new(name)).unwrap();
+            index.write().unwrap();
+            let d = staged_diff(&repo, name).unwrap();
+            assert_eq!(changes(&d), ["+edited"], "staged diff of {name}");
+        }
+    }
+
+    /// `+text` / `-text` for every changed line of a diff.
+    fn changes(diff: &FileDiff) -> Vec<String> {
+        diff.hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .filter_map(|l| match l.kind {
+                LineKind::Add => Some(format!("+{}", l.text)),
+                LineKind::Del => Some(format!("-{}", l.text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn stage(repo: &git2::Repository, path: &str, contents: &[u8]) {
+        let full = repo.workdir().unwrap().join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, contents).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(path)).unwrap();
+        index.write().unwrap();
+    }
+
+    #[test]
+    fn commit_diff_of_root_commit_is_all_adds() {
+        let (_dir, repo) = testutil::init_repo();
+        let root = testutil::commit_file(&repo, "a.txt", "one\ntwo\n", "init").to_string();
+        testutil::commit_file(&repo, "a.txt", "one\ntwo\nthree\n", "later");
+
+        assert_eq!(commit_files(&repo, &root).unwrap(), ["a.txt"]);
+        let d = commit_file_diff(&repo, &root, "a.txt").unwrap();
+        assert_eq!(d.path, "a.txt");
+        assert!(!d.binary);
+        assert_eq!(d.hunks.len(), 1);
+        assert_eq!(d.hunks[0].old_start, 0);
+        assert_eq!(d.hunks[0].new_start, 1);
+        assert_eq!(changes(&d), ["+one", "+two"]);
+    }
+
+    #[test]
+    fn commit_diff_covers_each_file_of_a_two_file_commit() {
+        let (_dir, repo) = testutil::init_repo();
+        let (base, _) = two_region_contents();
+        testutil::commit_file(&repo, "a.txt", &base, "init");
+        testutil::commit_file(&repo, "sub/b.txt", "b\n", "add b");
+        testutil::commit_file(&repo, "untouched.txt", "same\n", "add untouched");
+        stage(
+            &repo,
+            "a.txt",
+            base.replacen("line 20\n", "line 20 CHANGED\n", 1)
+                .as_bytes(),
+        );
+        stage(&repo, "sub/b.txt", b"b\nmore\n");
+        let oid = testutil::commit_index(&repo, "touch two files").to_string();
+        // A later commit must not leak into the answer.
+        testutil::commit_file(&repo, "a.txt", "rewritten\n", "later");
+
+        assert_eq!(commit_files(&repo, &oid).unwrap(), ["a.txt", "sub/b.txt"]);
+        let a = commit_file_diff(&repo, &oid, "a.txt").unwrap();
+        assert_eq!(changes(&a), ["-line 20", "+line 20 CHANGED"]);
+        // Same shape as the working-tree diffs: context and line numbers.
+        assert_eq!(a.hunks.len(), 1);
+        assert_eq!((a.hunks[0].old_start, a.hunks[0].new_start), (17, 17));
+        assert!(a.hunks[0]
+            .lines
+            .iter()
+            .any(|l| l.kind == LineKind::Context && l.text == "line 19"));
+        let b = commit_file_diff(&repo, &oid, "sub/b.txt").unwrap();
+        assert_eq!(changes(&b), ["+more"]);
+        // A file the commit left alone has no diff.
+        let none = commit_file_diff(&repo, &oid, "untouched.txt").unwrap();
+        assert!(none.hunks.is_empty() && !none.binary);
+    }
+
+    #[test]
+    fn commit_diff_of_deleted_file_is_all_dels() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "keep.txt", "keep\n", "init");
+        testutil::commit_file(&repo, "gone.txt", "one\ntwo\n", "add gone");
+        let oid = testutil::commit_removal(&repo, "gone.txt", "drop gone").to_string();
+
+        assert_eq!(commit_files(&repo, &oid).unwrap(), ["gone.txt"]);
+        let d = commit_file_diff(&repo, &oid, "gone.txt").unwrap();
+        assert_eq!(changes(&d), ["-one", "-two"]);
+        assert_eq!(d.hunks[0].new_start, 0);
+    }
+
+    #[test]
+    fn commit_diff_lists_a_rename_once_and_shows_only_its_edits() {
+        let (_dir, repo) = testutil::init_repo();
+        let (base, _) = two_region_contents();
+        testutil::commit_file(&repo, "old.txt", &base, "init");
+        // Rename with one edited line, in a single commit.
+        fs::remove_file(repo.workdir().unwrap().join("old.txt")).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("old.txt")).unwrap();
+        index.write().unwrap();
+        stage(
+            &repo,
+            "new.txt",
+            base.replacen("line 20\n", "line 20 CHANGED\n", 1)
+                .as_bytes(),
+        );
+        let oid = testutil::commit_index(&repo, "rename").to_string();
+
+        assert_eq!(commit_files(&repo, &oid).unwrap(), ["new.txt"]);
+        let d = commit_file_diff(&repo, &oid, "new.txt").unwrap();
+        assert_eq!(d.path, "new.txt");
+        assert_eq!(changes(&d), ["-line 20", "+line 20 CHANGED"]);
+    }
+
+    #[test]
+    fn commit_diff_flags_binary_files_and_rejects_bad_ids() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        stage(&repo, "img.png", PNG_BYTES);
+        let oid = testutil::commit_index(&repo, "add image").to_string();
+        let d = commit_file_diff(&repo, &oid, "img.png").unwrap();
+        assert!(d.binary);
+        assert!(d.hunks.is_empty());
+
+        assert!(matches!(
+            commit_file_diff(&repo, "not-an-oid", "a.txt"),
+            Err(GitError::Log(_))
+        ));
+        let missing = "0123456789012345678901234567890123456789";
+        assert!(matches!(
+            commit_files(&repo, missing),
+            Err(GitError::Log(_))
+        ));
     }
 }
