@@ -2219,10 +2219,21 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    btn_spans.push(Span::styled(
-        "click a row to move · click its hunk header to jump".to_string(),
-        Style::default().fg(theme.hint),
-    ));
+    // The main footer (where errors and notices normally show) is behind
+    // this overlay, so they take the hint's place here.
+    btn_spans.push(match (app.error(), app.notice()) {
+        (Some(error), _) => Span::styled(
+            error.to_string(),
+            Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
+        ),
+        (None, Some(notice)) => Span::styled(notice.to_string(), Style::default().fg(theme.staged)),
+        (None, None) => Span::styled(
+            "click a row to move · click its hunk header to jump".to_string(),
+            Style::default().fg(theme.hint),
+        ),
+    });
     let btn_y = hit_y(lines.len());
     lines.push(Line::from(btn_spans));
     app.set_hit(HitMap::Full, hit);
