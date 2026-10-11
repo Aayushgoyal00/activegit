@@ -16,6 +16,12 @@ pub(crate) enum MenuAction {
     Footer(FooterAction),
     Refresh,
     Help,
+    Fetch,
+    ForcePush,
+    Amend,
+    Undo,
+    AbortOperation,
+    ContinueOperation,
     MarkdownPreview,
     LlmSettings,
     Focus(Focus),
@@ -54,13 +60,30 @@ pub(crate) enum MenuContext {
 /// Entries for where the menu was opened. Actions on "the selected" file,
 /// hunk, branch or stash only appear while their panel is focused, so the
 /// thing they act on is the one highlighted behind the menu.
-pub(crate) fn entries(context: MenuContext) -> Vec<MenuEntry> {
+pub(crate) fn entries(context: MenuContext, operation: Option<&'static str>) -> Vec<MenuEntry> {
     use FooterAction as F;
     use MenuAction as M;
     let focus = match context {
         MenuContext::Panel(focus) => focus,
         MenuContext::FullDiff => return fullscreen_entries(),
     };
+    let mut out = Vec::new();
+    // A merge or rebase stopped half-way comes first: it is what the user
+    // has to deal with before anything else.
+    if let Some(operation) = operation {
+        out.push(MenuEntry {
+            group: operation,
+            label: "Continue (conflicts resolved and staged)",
+            action: M::ContinueOperation,
+            destructive: false,
+        });
+        out.push(MenuEntry {
+            group: operation,
+            label: "Abort and go back to before it started",
+            action: M::AbortOperation,
+            destructive: true,
+        });
+    }
     let entry = |group, label, action| MenuEntry {
         group,
         label,
@@ -73,7 +96,6 @@ pub(crate) fn entries(context: MenuContext) -> Vec<MenuEntry> {
         action,
         destructive: true,
     };
-    let mut out = Vec::new();
     match focus {
         Focus::Status => out.extend([
             entry("Files", "Stage / unstage selected", M::Footer(F::Stage)),
@@ -90,6 +112,8 @@ pub(crate) fn entries(context: MenuContext) -> Vec<MenuEntry> {
     }
     out.extend([
         entry("Files", "Commit", M::Footer(F::Commit)),
+        entry("Files", "Amend last commit", M::Amend),
+        entry("Files", "Undo last discard", M::Undo),
         entry("Files", "Find file", M::Footer(F::Find)),
         entry("Files", "Toggle Markdown preview", M::MarkdownPreview),
         entry("Files", "Refresh", M::Refresh),
@@ -121,8 +145,10 @@ pub(crate) fn entries(context: MenuContext) -> Vec<MenuEntry> {
         ));
     }
     out.extend([
+        entry("Sync", "Fetch", M::Fetch),
         entry("Sync", "Pull", M::Footer(F::Pull)),
         entry("Sync", "Push", M::Footer(F::Push)),
+        danger("Sync", "Force push (with lease)", M::ForcePush),
         entry("Go to", "Files", M::Focus(Focus::Status)),
         entry("Go to", "Branches", M::Focus(Focus::Branches)),
         entry("Go to", "Commits", M::Focus(Focus::Log)),
@@ -211,6 +237,9 @@ pub(crate) fn key_hint(action: MenuAction, keys: &KeyBindings) -> String {
         M::Footer(F::Menu) => &keys.action_menu,
         M::Footer(F::Copy) => &[KeyCode::Char('y')],
         M::Refresh => &keys.refresh,
+        M::Fetch => &keys.sync_fetch,
+        M::Undo => &keys.undo,
+        M::ForcePush | M::Amend | M::AbortOperation | M::ContinueOperation => &[],
         M::Help => &[KeyCode::F(1)],
         M::MarkdownPreview => &keys.toggle_markdown_preview,
         M::LlmSettings => &keys.llm_settings,
@@ -452,7 +481,7 @@ mod tests {
     #[test]
     fn selection_actions_only_show_for_the_focused_panel() {
         let has = |focus, label: &str| {
-            entries(MenuContext::Panel(focus))
+            entries(MenuContext::Panel(focus), None)
                 .iter()
                 .any(|e| e.label == label)
         };
@@ -493,12 +522,12 @@ mod tests {
             Focus::Stash,
             Focus::Diff,
         ] {
-            for e in entries(MenuContext::Panel(focus)) {
+            for e in entries(MenuContext::Panel(focus), None) {
                 let discards = matches!(
                     e.action,
                     MenuAction::Footer(
                         F::Discard | F::RestoreHunk | F::DeleteBranch | F::StashDrop
-                    )
+                    ) | MenuAction::ForcePush
                 );
                 assert_eq!(e.destructive, discards, "{}", e.label);
             }
@@ -531,7 +560,7 @@ mod tests {
 
     #[test]
     fn fullscreen_menu_reaches_the_destructive_actions_too() {
-        let labels: Vec<&str> = entries(MenuContext::FullDiff)
+        let labels: Vec<&str> = entries(MenuContext::FullDiff, None)
             .iter()
             .map(|e| e.label)
             .collect();
@@ -545,5 +574,15 @@ mod tests {
         }
         // Nothing that needs the main view behind it.
         assert!(!labels.contains(&"Theme"));
+    }
+
+    #[test]
+    fn an_operation_in_progress_puts_continue_and_abort_first() {
+        let menu = entries(MenuContext::Panel(Focus::Status), Some("Merge in progress"));
+        assert_eq!(menu[0].action, MenuAction::ContinueOperation);
+        assert_eq!(menu[1].action, MenuAction::AbortOperation);
+        assert!(menu[1].destructive && !menu[0].destructive);
+        let plain = entries(MenuContext::Panel(Focus::Status), None);
+        assert!(plain.iter().all(|e| e.action != MenuAction::AbortOperation));
     }
 }

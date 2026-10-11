@@ -10,6 +10,7 @@ use git_tui_core::error::GitError;
 use git_tui_core::jobqueue::{AsyncJob, AsyncResult, JobId, JobQueue};
 use git_tui_core::llm::LlmConfig;
 use git_tui_core::log::{CommitInfo, CommitOverview};
+use git_tui_core::repo::RepoState;
 use git_tui_core::stash::StashEntry;
 use git_tui_core::status::{FileState, RepoStatus, StatusEntry};
 use git_tui_core::sync::SyncStatus;
@@ -86,8 +87,10 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
     Commit,
-    /// Changes the repository: stage, discard, branch, stash.
+    /// Changes the repository: stage, branch, stash.
     Mutation,
+    /// A discard: like any mutation, and it can be undone.
+    Discard,
     /// Push, pull, publish.
     Sync,
     Generate,
@@ -107,6 +110,19 @@ pub(crate) enum Danger {
     RestoreHunk,
     DeleteBranch,
     DropStash,
+    ForcePush,
+    AbortOperation,
+}
+
+/// A commit opened from the commits panel: its files are stepped through
+/// in the fullscreen diff, read-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitView {
+    pub(crate) oid: String,
+    /// Short id for the title.
+    pub(crate) id: String,
+    pub(crate) files: Vec<String>,
+    pub(crate) index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +135,11 @@ pub(crate) enum DangerAction {
     },
     DeleteBranch(String),
     DropStash(usize),
+    ForcePush {
+        remote: String,
+        branch: String,
+    },
+    AbortOperation,
 }
 
 struct Confirm {
@@ -365,6 +386,12 @@ pub struct App {
     /// the view the search box was opened over.
     search: Option<String>,
     search_return: Mode,
+    /// Merge / rebase / cherry-pick / revert in progress, if any.
+    repo_state: RepoState,
+    /// The commit box is rewording the last commit instead of making one.
+    amending: bool,
+    /// A commit being viewed file by file (Enter in the commits panel).
+    commit_view: Option<CommitView>,
     /// Partly staged file whose staged half is shown instead of the
     /// unstaged one (`S` flips). Tied to the path, so moving to another
     /// file is back to the usual view.
@@ -763,6 +790,9 @@ impl App {
             help_return: Mode::Normal,
             search: None,
             search_return: Mode::Normal,
+            repo_state: RepoState::Clean,
+            amending: false,
+            commit_view: None,
             staged_side_for: None,
             log_limit: Self::LOG_LIMIT,
             overview_scroll: Cell::new(0),
@@ -1232,7 +1262,7 @@ impl App {
     /// match first otherwise. Labels are matched first; group names match
     /// too (`sync`, `stash`) and those entries follow.
     pub(crate) fn menu_matches(&self) -> Vec<MenuEntry> {
-        let all = crate::menu::entries(self.menu_context());
+        let all = crate::menu::entries(self.menu_context(), self.operation_in_progress());
         let query = self.draft.trim().to_lowercase();
         if query.is_empty() {
             return all;
@@ -1312,6 +1342,16 @@ impl App {
             MenuAction::Footer(action) => self.click_footer_button(action),
             MenuAction::Refresh => self.refresh_all(),
             MenuAction::Help => self.begin_help(),
+            MenuAction::Fetch => self.start_fetch(),
+            MenuAction::ForcePush => self.request_danger(Danger::ForcePush),
+            MenuAction::Amend => self.begin_amend(),
+            MenuAction::Undo => self.undo_discard(),
+            MenuAction::AbortOperation => self.request_danger(Danger::AbortOperation),
+            MenuAction::ContinueOperation => {
+                if let Err(e) = self.submit_job(AsyncJob::ContinueOperation) {
+                    self.error = Some(e.to_string());
+                }
+            }
             MenuAction::MarkdownPreview => self.toggle_markdown_preview(),
             MenuAction::LlmSettings => self.begin_llm_settings(),
             MenuAction::Focus(focus) => {
@@ -2066,6 +2106,7 @@ impl App {
             },
             AsyncJob::ListStash,
             AsyncJob::LoadSync,
+            AsyncJob::LoadRepoState,
         ];
         for job in jobs {
             if let Err(e) = self.submit_job(job) {
@@ -2534,6 +2575,10 @@ impl App {
         let Some((path, staged)) = self.diff_for.clone() else {
             return;
         };
+        if self.commit_view.is_some() {
+            // A commit never changes: nothing to reload.
+            return;
+        }
         let job = if self.diff_whole_file {
             AsyncJob::LoadFile { path }
         } else {
@@ -2791,8 +2836,9 @@ impl App {
                     | Mode::Help => {}
                 },
                 KeyCode::Esc => {
-                    if self.mode == Mode::Committing {
+                    if self.mode == Mode::Committing && !self.amending {
                         // Closing the box is not throwing the text away.
+                        // (An amend box holds the old message: nothing new.)
                         self.commit_stash = std::mem::take(&mut self.draft);
                     }
                     self.mode = match self.mode {
@@ -2912,6 +2958,8 @@ impl App {
             self.checkout_selected_branch();
         } else if k.stash_pop.contains(&key) && self.focus == Focus::Stash {
             self.pop_selected_stash();
+        } else if key == KeyCode::Enter && self.focus == Focus::Log {
+            self.open_commit_view();
         } else if key == KeyCode::Enter && matches!(self.focus, Focus::Status | Focus::Diff) {
             // Enter on a file opens it fullscreen (checkout/pop own Enter
             // in their own panels, so no conflict). Works from the file
@@ -2960,6 +3008,10 @@ impl App {
             self.start_pull();
         } else if k.sync_push.contains(&key) {
             self.start_push();
+        } else if k.sync_fetch.contains(&key) {
+            self.start_fetch();
+        } else if k.undo.contains(&key) {
+            self.undo_discard();
         } else if k.quit.contains(&key) {
             self.quit = true;
         }
@@ -2979,6 +3031,30 @@ impl App {
     /// file list.
     fn on_key_full_diff(&mut self, key: KeyCode) {
         let k = self.keys.clone();
+        if self.commit_view.is_some() {
+            // Read-only: the keys that change the working tree say so,
+            // closing and file stepping act on the commit.
+            let closes = key == KeyCode::Esc && self.visual.is_none()
+                || (k.project_close.contains(&key) && !k.quit.contains(&key));
+            if closes {
+                return self.close_commit_view();
+            }
+            if key == KeyCode::Char(']') {
+                return self.step_commit_view(true);
+            }
+            if key == KeyCode::Char('[') {
+                return self.step_commit_view(false);
+            }
+            let changes_things = k.stage.contains(&key)
+                || k.discard.contains(&key)
+                || matches!(key, KeyCode::Char('x' | 'X' | 'S'))
+                || k.find_files.contains(&key)
+                || k.toggle_markdown_preview.contains(&key);
+            if changes_things {
+                self.notice = Some("this is a commit, shown read-only (esc goes back)".into());
+                return;
+            }
+        }
         if key == KeyCode::Esc {
             if self.visual.is_some() {
                 self.visual = None;
@@ -3053,9 +3129,94 @@ impl App {
             self.start_pull();
         } else if k.sync_push.contains(&key) {
             self.start_push();
+        } else if k.sync_fetch.contains(&key) {
+            self.start_fetch();
         } else if k.quit.contains(&key) {
             self.quit = true;
         }
+    }
+
+    /// Enter on a commit: open what it changed, file by file, in the
+    /// fullscreen diff (`]` / `[` step through its files).
+    fn open_commit_view(&mut self) {
+        let Some(commit) = self.selected_commit() else {
+            return;
+        };
+        let files: Vec<String> = match self.commit_overview.as_ref() {
+            Some(overview) if overview.oid == commit.oid => {
+                overview.files.iter().map(|f| f.path.clone()).collect()
+            }
+            _ => {
+                self.notice = Some("still loading this commit — try again in a moment".into());
+                return;
+            }
+        };
+        if files.is_empty() {
+            self.notice = Some("this commit changed no files".into());
+            return;
+        }
+        self.commit_view = Some(CommitView {
+            oid: commit.oid.clone(),
+            id: commit.oid.chars().take(7).collect(),
+            files,
+            index: 0,
+        });
+        self.mode = Mode::FullDiff;
+        self.load_commit_view_file();
+    }
+
+    /// The commit being viewed, if any.
+    pub(crate) fn commit_view(&self) -> Option<&CommitView> {
+        self.commit_view.as_ref()
+    }
+
+    fn load_commit_view_file(&mut self) {
+        let Some(view) = self.commit_view.as_ref() else {
+            return;
+        };
+        let path = view.files[view.index.min(view.files.len() - 1)].clone();
+        let oid = view.oid.clone();
+        self.diff_for = Some((path.clone(), false));
+        self.diff_whole_file = false;
+        self.fallback_whole_file = false;
+        self.set_diff(None);
+        self.visual = None;
+        self.hunk = 0;
+        self.cursor = 0;
+        self.cursor_col = 0;
+        self.diff_scroll = 0;
+        if let Err(e) = self.submit_job(AsyncJob::LoadCommitDiff { oid, path }) {
+            self.error = Some(e.to_string());
+        }
+    }
+
+    fn step_commit_view(&mut self, down: bool) {
+        let Some(view) = self.commit_view.as_mut() else {
+            return;
+        };
+        let last = view.files.len() - 1;
+        let next = if down {
+            (view.index + 1).min(last)
+        } else {
+            view.index.saturating_sub(1)
+        };
+        if next == view.index {
+            self.notice = Some(if down { "last file" } else { "first file" }.into());
+            return;
+        }
+        view.index = next;
+        self.load_commit_view_file();
+    }
+
+    /// Leave the commit view: back to the commits panel and the working
+    /// tree's own diff.
+    fn close_commit_view(&mut self) {
+        self.commit_view = None;
+        self.mode = Mode::Normal;
+        self.visual = None;
+        self.diff_for = None;
+        self.set_diff(None);
+        self.maybe_load_diff();
     }
 
     /// Enter on a file: open its diff fullscreen.
@@ -3628,9 +3789,13 @@ impl App {
             self.focus = Focus::Log;
             let scroll = self.log_scroll.get();
             let count = self.log_count();
-            self.click_list_row(row, layout.commits, scroll, count, |app, i| {
+            let before = self.log_selected;
+            let hit = self.click_list_row(row, layout.commits, scroll, count, |app, i| {
                 app.log_selected = i;
             });
+            if hit && self.double_click && self.log_selected == before {
+                self.open_commit_view();
+            }
         } else if mouse_in(col, row, layout.stash) {
             self.focus = Focus::Stash;
             let scroll = self.stash_scroll.get();
@@ -3825,6 +3990,19 @@ impl App {
 
     /// Fire a footer button (mouse) with the same semantics as its key.
     pub(crate) fn click_footer_button(&mut self, action: FooterAction) {
+        if self.commit_view.is_some() && self.mode == Mode::FullDiff {
+            match action {
+                FooterAction::CloseDiff => return self.close_commit_view(),
+                FooterAction::StageHunk
+                | FooterAction::RestoreHunk
+                | FooterAction::Discard
+                | FooterAction::Find => {
+                    self.notice = Some("this is a commit, shown read-only (esc goes back)".into());
+                    return;
+                }
+                _ => {}
+            }
+        }
         match action {
             FooterAction::Stage => {
                 if self.focus == Focus::Status {
@@ -4244,10 +4422,13 @@ impl App {
     /// Space on one visible file: stage unless already fully staged.
     fn toggle_stage_file(&mut self, file: &StatusEntry) {
         if file.state == FileState::Conflicted {
-            self.error = Some(format!(
-                "conflicted: resolve markers in {} first",
-                file.path
-            ));
+            // Staging is how git is told a conflict is resolved; the
+            // worker refuses while the markers are still in the file.
+            if let Err(e) = self.submit_job(AsyncJob::ResolveFile {
+                path: file.path.clone(),
+            }) {
+                self.error = Some(e.to_string());
+            }
             return;
         }
         if file.state == FileState::Clean {
@@ -4458,6 +4639,35 @@ impl App {
         Ok((DangerAction::DeleteBranch(branch.name), prompt))
     }
 
+    fn plan_force_push(&self) -> Result<(DangerAction, String), String> {
+        let branch = match self.status.as_ref() {
+            Some(st) if !st.branch.starts_with('(') => st.branch.clone(),
+            Some(_) => return Err("nothing to push: HEAD is not on a branch".into()),
+            None => return Err("still loading — try again in a moment".into()),
+        };
+        let Some(upstream) = self.sync.as_ref().and_then(|s| s.upstream.clone()) else {
+            return Err("no upstream to force-push to: push normally first (P)".into());
+        };
+        let (remote, remote_branch) = split_upstream(&upstream);
+        // The tracked branch may have another name than the local one.
+        let refspec = if remote_branch.is_empty() || remote_branch == branch {
+            branch.clone()
+        } else {
+            format!("{branch}:{remote_branch}")
+        };
+        let prompt = format!(
+            "Force-push {branch} over {upstream}? Commits there that you do not have are \
+             lost (refused if someone pushed since your last fetch)."
+        );
+        Ok((
+            DangerAction::ForcePush {
+                remote: remote.to_string(),
+                branch: refspec,
+            },
+            prompt,
+        ))
+    }
+
     fn plan_drop_stash(&self) -> Result<(DangerAction, String), String> {
         let Some(entry) = self.selected_stash() else {
             return Err("no stash selected".into());
@@ -4476,6 +4686,17 @@ impl App {
             Danger::RestoreHunk => self.plan_restore_hunk(),
             Danger::DeleteBranch => self.plan_delete_branch(),
             Danger::DropStash => self.plan_drop_stash(),
+            Danger::ForcePush => self.plan_force_push(),
+            Danger::AbortOperation => match self.operation_in_progress() {
+                Some(operation) => Ok((
+                    DangerAction::AbortOperation,
+                    format!(
+                        "{operation}: abort it? Everything goes back to before it started; \
+                         conflict resolutions made so far are lost."
+                    ),
+                )),
+                None => Err("nothing to abort: no merge or rebase is in progress".into()),
+            },
         };
         let (action, prompt) = match plan {
             Ok(plan) => plan,
@@ -4536,10 +4757,13 @@ impl App {
 
     fn run_danger(&mut self, action: DangerAction) {
         let jobs: Vec<AsyncJob> = match action {
-            DangerAction::DiscardFiles(paths) => paths
-                .into_iter()
-                .map(|path| AsyncJob::DiscardFile { path })
-                .collect(),
+            // One job: one undo puts the whole set back.
+            DangerAction::DiscardFiles(paths) => vec![AsyncJob::DiscardFiles { paths }],
+            DangerAction::ForcePush { remote, branch } => {
+                self.syncing = Some("force-pushing…".into());
+                vec![AsyncJob::PushForce { remote, branch }]
+            }
+            DangerAction::AbortOperation => vec![AsyncJob::AbortOperation],
             DangerAction::RestoreHunk {
                 path,
                 hunk_index,
@@ -4572,8 +4796,11 @@ impl App {
             self.notice = Some("type a commit message first".into());
             return;
         }
-        let job = AsyncJob::Commit {
-            message: self.draft.clone(),
+        let message = self.draft.clone();
+        let job = if self.amending {
+            AsyncJob::Amend { message }
+        } else {
+            AsyncJob::Commit { message }
         };
         match self.submit_job(job) {
             Ok(()) => {
@@ -4589,6 +4816,7 @@ impl App {
     /// `c`: open the commit box. A message left there earlier (Esc, or a
     /// commit that failed) is still in it.
     fn open_commit_box(&mut self) {
+        self.amending = false;
         self.mode = Mode::Committing;
         self.draft = self.commit_stash.clone();
         self.move_draft_end();
@@ -4687,6 +4915,9 @@ impl App {
     /// A listed file whose diff arrives empty (e.g. a mode-only change)
     /// falls back to the whole file instead of showing "(no changes)".
     fn maybe_load_diff(&mut self) {
+        if self.commit_view.is_some() {
+            return;
+        }
         let target = self.diff_target();
         // A new path drops the empty-diff fallback; it applies per file.
         let path_changed =
@@ -4725,6 +4956,9 @@ impl App {
     /// shows the whole file and a pop shows the restored hunks — no flash
     /// of wrong content, no wasted worker roundtrip.
     fn force_reload_diff_for_fresh_status(&mut self) {
+        if self.commit_view.is_some() {
+            return self.load_commit_view_file();
+        }
         let target = self.diff_target();
         let path_changed =
             target.as_ref().map(|(p, _)| p) != self.diff_for.as_ref().map(|(p, _)| p);
@@ -4969,6 +5203,35 @@ impl App {
     /// `p`, lazygit-style: pull the current branch (`git pull`, honoring
     /// the user's pull.rebase/pull.ff config). Runs on the worker thread;
     /// the status panel shows "pulling…" until it lands or fails.
+    /// `f`: fetch, so the ahead/behind counts reflect the remote.
+    fn start_fetch(&mut self) {
+        self.syncing = Some("fetching…".into());
+        if let Err(e) = self.submit_job(AsyncJob::Fetch) {
+            self.syncing = None;
+            self.error = Some(e.to_string());
+        }
+    }
+
+    /// `u`: put back what the last discard threw away.
+    fn undo_discard(&mut self) {
+        if let Err(e) = self.submit_job(AsyncJob::UndoDiscard) {
+            self.error = Some(e.to_string());
+        }
+    }
+
+    /// Reword (and add staged changes to) the last commit: the commit box
+    /// opens with its message once the worker has read it.
+    fn begin_amend(&mut self) {
+        if let Err(e) = self.submit_job(AsyncJob::LoadLastCommitMessage) {
+            self.error = Some(e.to_string());
+        }
+    }
+
+    /// The commit box is amending the last commit.
+    pub fn is_amending(&self) -> bool {
+        self.amending && self.mode == Mode::Committing
+    }
+
     fn start_pull(&mut self) {
         self.syncing = Some("pulling…".into());
         if let Err(e) = self.submit_job(AsyncJob::Pull) {
@@ -5035,11 +5298,11 @@ impl App {
             self.mode = self.sync_return;
             return;
         };
-        match self.submit_job(AsyncJob::Push {
-            remote,
-            branch,
-            set_upstream: false,
-        }) {
+        // The confirm box showed where it goes; the job resolves the
+        // tracked branch itself, so a differently named upstream is pushed
+        // to instead of a new remote branch being created.
+        let _ = (remote, branch);
+        match self.submit_job(AsyncJob::PushUpstream) {
             Ok(()) => {
                 self.mode = self.sync_return;
                 self.pending_push = None;
@@ -5109,8 +5372,23 @@ impl App {
 
     /// Refresh upstream tracking state (cheap local reads, no network).
     fn reload_sync(&mut self) {
-        if let Err(e) = self.submit_job(AsyncJob::LoadSync) {
-            self.error = Some(e.to_string());
+        for job in [AsyncJob::LoadSync, AsyncJob::LoadRepoState] {
+            if let Err(e) = self.submit_job(job) {
+                self.error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Operation in progress, as a heading for the menu and status line.
+    pub fn operation_in_progress(&self) -> Option<&'static str> {
+        match self.repo_state {
+            RepoState::Clean => None,
+            RepoState::Merge => Some("Merge in progress"),
+            RepoState::Rebase => Some("Rebase in progress"),
+            RepoState::CherryPick => Some("Cherry-pick in progress"),
+            RepoState::Revert => Some("Revert in progress"),
+            RepoState::Bisect => Some("Bisect in progress"),
+            RepoState::Other => Some("Operation in progress"),
         }
     }
 
@@ -5144,14 +5422,24 @@ impl App {
     /// Submit a job and remember what kind it is until its result arrives.
     fn submit_job(&mut self, job: AsyncJob) -> Result<(), GitError> {
         let kind = match &job {
-            AsyncJob::Commit { .. } => Pending::Commit,
-            AsyncJob::Push { .. } | AsyncJob::Pull | AsyncJob::Publish { .. } => Pending::Sync,
+            AsyncJob::Commit { .. } | AsyncJob::Amend { .. } => Pending::Commit,
+            AsyncJob::Push { .. }
+            | AsyncJob::Pull
+            | AsyncJob::Fetch
+            | AsyncJob::PushUpstream
+            | AsyncJob::PushForce { .. }
+            | AsyncJob::Publish { .. } => Pending::Sync,
+            AsyncJob::DiscardFile { .. }
+            | AsyncJob::DiscardFiles { .. }
+            | AsyncJob::DiscardHunk { .. } => Pending::Discard,
             AsyncJob::GenerateCommitMessage { .. } => Pending::Generate,
             AsyncJob::StageHunk { .. }
-            | AsyncJob::DiscardHunk { .. }
             | AsyncJob::StageFile { .. }
+            | AsyncJob::ResolveFile { .. }
             | AsyncJob::UnstageFile { .. }
-            | AsyncJob::DiscardFile { .. }
+            | AsyncJob::UndoDiscard
+            | AsyncJob::AbortOperation
+            | AsyncJob::ContinueOperation
             | AsyncJob::CreateBranch { .. }
             | AsyncJob::CheckoutBranch { .. }
             | AsyncJob::DeleteBranch { .. }
@@ -5171,7 +5459,7 @@ impl App {
     fn mutation_in_flight(&self) -> bool {
         self.inflight
             .values()
-            .any(|kind| matches!(kind, Pending::Mutation | Pending::Commit))
+            .any(|kind| matches!(kind, Pending::Mutation | Pending::Discard | Pending::Commit))
     }
 
     /// A new action dismisses the previous error/notice; failures of the
@@ -5332,10 +5620,32 @@ impl App {
                     Pending::Sync => self.syncing = None,
                     // The message is in the history now.
                     Pending::Commit => self.commit_stash.clear(),
+                    Pending::Discard => {
+                        let key = crate::menu::key_hint(MenuAction::Undo, &self.keys);
+                        self.notice = Some(format!("discarded ({key} puts it back)"));
+                    }
                     _ => {}
                 }
                 self.reload_after_change();
             }
+            AsyncResult::Undone(count) => {
+                self.notice = Some(format!(
+                    "put back {count} file{}",
+                    if count == 1 { "" } else { "s" }
+                ));
+                self.reload_after_change();
+            }
+            AsyncResult::RepoState(state) => self.repo_state = state,
+            AsyncResult::LastCommitMessage(message) => match message {
+                Some(message) if self.mode == Mode::Normal => {
+                    self.amending = true;
+                    self.mode = Mode::Committing;
+                    self.draft = message.trim_end().to_string();
+                    self.move_draft_end();
+                }
+                Some(_) => {}
+                None => self.error = Some("nothing to amend: no commits yet".into()),
+            },
             AsyncResult::Superseded => {}
             AsyncResult::Error(e) => {
                 // EmptyCommit on its own doesn't say how to fix it.
@@ -5359,11 +5669,13 @@ impl App {
                     Pending::Commit => {
                         // Give the message back instead of losing it.
                         if self.mode == Mode::Normal && !self.commit_stash.is_empty() {
+                            let amending = self.amending;
                             self.open_commit_box();
+                            self.amending = amending;
                         }
                         self.reload_after_change();
                     }
-                    Pending::Mutation => self.reload_after_change(),
+                    Pending::Mutation | Pending::Discard => self.reload_after_change(),
                     // A failed load leaves status unchanged: drop any
                     // deferred reload so the preview recovers via the
                     // normal `maybe_load_diff` path on the next poll.
@@ -5449,6 +5761,10 @@ mod tests {
         cfg.set_str("user.email", "test@example.com").unwrap();
         // Git for Windows enables autocrlf system-wide; keep checkouts byte-exact.
         cfg.set_str("core.autocrlf", "false").unwrap();
+        // Commits go through the git CLI: a global signing key or hooks
+        // path must not reach into the tests.
+        cfg.set_str("commit.gpgsign", "false").unwrap();
+        cfg.set_str("core.hooksPath", ".git/no-hooks").unwrap();
         (dir, repo)
     }
 
@@ -5977,7 +6293,7 @@ mod tests {
     }
 
     #[test]
-    fn space_on_conflicted_reports_error() {
+    fn space_on_conflicted_asks_the_worker_to_resolve_it() {
         let mut fx = harness(&[]);
         fx.app.status = Some(RepoStatus {
             branch: "main".into(),
@@ -5989,8 +6305,13 @@ mod tests {
             tracked_files: vec!["a.txt".into()],
         });
         fx.app.rebuild_file_list();
+        // Not refused up front any more: staging is how a conflict is
+        // marked resolved. (`d` on it is still refused.)
         fx.app.on_key(KeyCode::Char(' '));
-        assert!(fx.app.error().is_some(), "expected conflict error");
+        assert!(fx.app.error().is_none());
+        assert!(fx.app.mutation_in_flight());
+        fx.app.on_key(KeyCode::Char('d'));
+        assert!(fx.app.error().unwrap().contains("conflicted"));
     }
 
     #[test]
@@ -9361,5 +9682,260 @@ mod tests {
         fx.app.on_key(KeyCode::Char('P'));
         assert_eq!(fx.app.mode(), Mode::Normal, "no upstream prompt");
         assert!(fx.app.error().unwrap().contains("not on a branch"));
+    }
+
+    // ---- undo, fetch, amend, commit view, operations ----
+
+    fn wait_until(app: &mut App, what: &str, mut done: impl FnMut(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            app.poll();
+            if done(app) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn u_puts_back_the_last_discard() {
+        let mut fx = harness(&["a.txt"]);
+        let file = fx._dir.path().join("a.txt");
+        let dirty = std::fs::read_to_string(&file).unwrap();
+        fx.app.on_key(KeyCode::Char('d'));
+        fx.app.on_key(KeyCode::Enter);
+        wait_for(&mut fx.app, |st| st.files.is_empty());
+        assert_ne!(std::fs::read_to_string(&file).unwrap(), dirty);
+        assert!(
+            fx.app.notice().unwrap_or("").contains("u puts it back"),
+            "the way back is announced: {:?}",
+            fx.app.notice()
+        );
+        fx.app.on_key(KeyCode::Char('u'));
+        wait_for(&mut fx.app, |st| st.files.iter().any(|e| e.path == "a.txt"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), dirty);
+        // Spent: a second undo says so instead of doing something else.
+        fx.app.on_key(KeyCode::Char('u'));
+        let err = wait_for_error(&mut fx.app);
+        assert!(err.contains("nothing to undo"), "got: {err}");
+    }
+
+    #[test]
+    fn discarding_a_folder_is_one_undo() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "src/a.rs", "a\n", "init");
+        commit_file(&repo, "src/b.rs", "b\n", "init");
+        let root = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(root.join("src/a.rs"), "a2\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "b2\n").unwrap();
+        std::fs::write(root.join("src/new.rs"), "new\n").unwrap();
+        drop(repo);
+        let mut fx = Fixture {
+            _dir: dir,
+            app: App::new(JobQueue::spawn(&root).unwrap()),
+        };
+        wait_for(&mut fx.app, |st| st.files.len() == 3);
+        // The cursor starts on the open `src/` header.
+        fx.app.on_key(KeyCode::Char('g'));
+        fx.app.on_key(KeyCode::Char('d'));
+        let prompt = fx.app.confirm_prompt().unwrap().to_string();
+        assert!(prompt.contains("3 files under src/"), "{prompt}");
+        assert!(prompt.contains("1 untracked will be deleted"), "{prompt}");
+        fx.app.on_key(KeyCode::Enter);
+        wait_for(&mut fx.app, |st| st.files.is_empty());
+        assert!(!root.join("src/new.rs").exists());
+        fx.app.on_key(KeyCode::Char('u'));
+        wait_for(&mut fx.app, |st| st.files.len() == 3);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "a2\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/new.rs")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[test]
+    fn f_fetches_and_reports_when_there_is_no_remote() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('f'));
+        assert_eq!(fx.app.syncing(), Some("fetching…"));
+        let err = wait_for_error(&mut fx.app);
+        assert!(err.contains("no remote"), "got: {err}");
+        assert!(
+            fx.app.syncing().is_none(),
+            "the label must clear on failure"
+        );
+    }
+
+    #[test]
+    fn amend_opens_the_box_with_the_last_message_and_rewrites_it() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('?'));
+        type_into_menu(&mut fx.app, "amend");
+        fx.app.on_key(KeyCode::Enter);
+        wait_until(&mut fx.app, "the amend box", |app| {
+            app.mode() == Mode::Committing
+        });
+        assert!(fx.app.is_amending());
+        assert_eq!(fx.app.draft(), "init");
+        fx.app.on_chord(Chord::Ctrl('u'));
+        fx.app.on_paste("init, reworded");
+        fx.app.on_key(KeyCode::Enter);
+        fx.app.on_key(KeyCode::Char('3'));
+        wait_until(&mut fx.app, "the reworded commit", |app| {
+            app.log()
+                .is_some_and(|log| log.first().is_some_and(|c| c.summary == "init, reworded"))
+        });
+        assert_eq!(fx.app.log().unwrap().len(), 1, "amended, not added");
+        // The next `c` is an ordinary, empty commit box again.
+        fx.app.on_key(KeyCode::Char('1'));
+        fx.app.on_key(KeyCode::Char('c'));
+        assert!(!fx.app.is_amending());
+        assert_eq!(fx.app.draft(), "");
+    }
+
+    #[test]
+    fn esc_in_the_amend_box_does_not_leak_the_old_message_into_the_next_commit() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('?'));
+        type_into_menu(&mut fx.app, "amend");
+        fx.app.on_key(KeyCode::Enter);
+        wait_until(&mut fx.app, "the amend box", |app| {
+            app.mode() == Mode::Committing
+        });
+        fx.app.on_key(KeyCode::Esc);
+        fx.app.on_key(KeyCode::Char('c'));
+        assert_eq!(fx.app.draft(), "");
+        assert!(!fx.app.is_amending());
+    }
+
+    #[test]
+    fn enter_on_a_commit_opens_its_files_read_only() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "one\n", "first");
+        // One commit touching two files.
+        let root = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(root.join("b.txt"), "bee\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.txt")).unwrap();
+        index.add_path(std::path::Path::new("b.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&parent])
+            .unwrap();
+        drop(tree);
+        drop(parent);
+        drop(repo);
+        let mut fx = Fixture {
+            _dir: dir,
+            app: App::new(JobQueue::spawn(&root).unwrap()),
+        };
+        fx.app.on_key(KeyCode::Char('3'));
+        wait_until(&mut fx.app, "the commit overview", |app| {
+            app.commit_overview
+                .as_ref()
+                .is_some_and(|o| o.files.len() == 2)
+        });
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        let view = fx.app.commit_view().unwrap().clone();
+        assert_eq!(view.files, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        wait_until(&mut fx.app, "the commit's diff", |app| app.diff().is_some());
+        assert_eq!(fx.app.diff().unwrap().path, "a.txt");
+        // The working tree is clean: this can only be the commit's diff.
+        assert_eq!(fx.app.diff().unwrap().hunks.len(), 1);
+        // Staging and discarding do nothing here.
+        fx.app.on_key(KeyCode::Char(' '));
+        fx.app.on_key(KeyCode::Char('d'));
+        fx.app.on_key(KeyCode::Char('x'));
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        assert!(fx.app.notice().unwrap().contains("read-only"));
+        assert!(!fx.app.mutation_in_flight());
+        // `]` goes to the commit's next file.
+        fx.app.on_key(KeyCode::Char(']'));
+        wait_until(&mut fx.app, "the second file", |app| {
+            app.diff().is_some_and(|d| d.path == "b.txt")
+        });
+        fx.app.on_key(KeyCode::Char(']'));
+        assert_eq!(fx.app.notice(), Some("last file"));
+        // Esc returns to the commits panel and the working tree's view.
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert!(fx.app.commit_view().is_none());
+        assert_eq!(fx.app.focus(), Focus::Log);
+    }
+
+    #[test]
+    fn force_push_needs_an_upstream_and_asks_first() {
+        let mut fx = harness(&["a.txt"]);
+        wait_for_sync(&mut fx.app);
+        fx.app.request_danger(Danger::ForcePush);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert!(fx.app.error().unwrap().contains("no upstream"));
+
+        let (_dir, _origin, mut app) = sync_harness();
+        wait_for_sync(&mut app);
+        app.request_danger(Danger::ForcePush);
+        // The sync harness has a remote but no upstream yet either.
+        assert!(app.error().unwrap().contains("no upstream"));
+    }
+
+    #[test]
+    fn a_merge_in_progress_is_shown_and_can_be_aborted() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "base\n", "init");
+        let root = repo.workdir().unwrap().to_path_buf();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stderr).to_string()
+        };
+        git(&["checkout", "-q", "-b", "other"]);
+        std::fs::write(root.join("a.txt"), "theirs\n").unwrap();
+        git(&["commit", "-q", "-am", "theirs"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("a.txt"), "mine\n").unwrap();
+        git(&["commit", "-q", "-am", "mine"]);
+        git(&["merge", "other"]);
+        drop(repo);
+        let mut fx = Fixture {
+            _dir: dir,
+            app: App::new(JobQueue::spawn(&root).unwrap()),
+        };
+        wait_until(&mut fx.app, "the merge state", |app| {
+            app.operation_in_progress().is_some()
+        });
+        assert_eq!(fx.app.operation_in_progress(), Some("Merge in progress"));
+        wait_for(&mut fx.app, |st| {
+            st.files.iter().any(|e| e.state == FileState::Conflicted)
+        });
+        // Space refuses while the markers are still there.
+        fx.app.on_key(KeyCode::Char(' '));
+        let err = wait_for_error(&mut fx.app);
+        assert!(err.contains("conflict markers"), "got: {err}");
+        // The menu leads with continue / abort; abort asks first.
+        fx.app.on_key(KeyCode::Char('?'));
+        assert_eq!(fx.app.menu_matches()[1].action, MenuAction::AbortOperation);
+        fx.app.on_key(KeyCode::Down);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Confirm);
+        assert!(fx.app.confirm_prompt().unwrap().contains("abort it?"));
+        fx.app.on_key(KeyCode::Enter);
+        wait_until(&mut fx.app, "the abort", |app| {
+            app.operation_in_progress().is_none()
+        });
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "mine\n"
+        );
     }
 }

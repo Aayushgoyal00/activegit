@@ -706,7 +706,14 @@ fn render_status_panel(frame: &mut Frame, area: Rect, app: &App) {
     let theme = app.theme();
     // Info strip only: the files panel below owns the Status-focus glow
     // (that is where the cursor lives), so this border stays dim.
-    let block = panel_block(false, theme, "[1]-Status".to_string());
+    let title = match app.operation_in_progress() {
+        Some(operation) => format!("[1]-Status · {operation} (? to continue or abort)"),
+        None => "[1]-Status".to_string(),
+    };
+    let mut block = panel_block(false, theme, title);
+    if app.operation_in_progress().is_some() {
+        block = block.border_style(Style::default().fg(theme.error));
+    }
     let sync = sync_suffix(app);
     let line = match app.status() {
         None => Line::raw("loading…"),
@@ -1928,7 +1935,15 @@ fn render_diff_pane(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     // LazyVim buffer header: file icon + path + mode, like `LazyVim ● file`.
-    let title = if app.diff_whole_file() {
+    let title = if let Some(view) = app.commit_view() {
+        format!(
+            " Commit {}: {} ({} of {}, ] [ next / previous file) ",
+            view.id,
+            diff.path,
+            view.index + 1,
+            view.files.len()
+        )
+    } else if app.diff_whole_file() {
         format!(" Full file: {} ", diff.path)
     } else if app.diff_viewing_staged() == Some(true) {
         format!(" Full diff: {} (staged) ", diff.path)
@@ -2868,6 +2883,8 @@ fn render_action_menu(frame: &mut Frame, area: Rect, app: &App) {
 fn commit_title(app: &App) -> &'static str {
     if app.is_generating() {
         " Commit message · generating… "
+    } else if app.is_amending() {
+        " Amend last commit (staged changes are added to it) "
     } else {
         " Commit message "
     }
@@ -3387,7 +3404,14 @@ fn render_confirm_push_modal(frame: &mut Frame, area: Rect, app: &App) {
     let block = panel_block(true, theme, " Push to upstream? ".to_string());
     let target = app
         .pending_push()
-        .map(|(remote, branch)| format!("{branch} → {remote}/{branch}"))
+        .map(|(remote, branch)| {
+            // The tracked branch can be named differently from the local.
+            let upstream = app
+                .sync()
+                .and_then(|s| s.upstream.clone())
+                .unwrap_or_else(|| format!("{remote}/{branch}"));
+            format!("{branch} → {upstream}")
+        })
         .unwrap_or_else(|| "(loading…)".to_string());
     let btn_style = Style::default()
         .fg(theme.border_focused)
@@ -4854,7 +4878,7 @@ mod tests {
     fn renders_error_line() {
         use crossterm::event::KeyCode;
         let (_dir, mut app) = with_files(&[("a.txt", FileState::Conflicted)]);
-        app.on_key(KeyCode::Char(' '));
+        app.on_key(KeyCode::Char('d'));
         let s = screen(&app, 40, 10);
         assert!(s.contains("conflicted"), "error missing:\n{s}");
     }

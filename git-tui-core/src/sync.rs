@@ -159,7 +159,9 @@ pub fn fetch(repo: &git2::Repository) -> Result<String, GitError> {
     if list_remotes(repo)?.is_empty() {
         return Err(GitError::Sync("no remote to fetch from".into()));
     }
-    run_git(&workdir, &["fetch", "--prune"])
+    // Every remote: a repo whose only remote is not called `origin` and
+    // has no upstream yet would otherwise have nothing to fetch from.
+    run_git(&workdir, &["fetch", "--all", "--prune"])
 }
 
 /// `git push --force-with-lease <remote> <branch>`: overwrite the remote
@@ -297,6 +299,11 @@ pub(crate) fn run_git_raw(
     let mut cmd = std::process::Command::new("git");
     cmd.args(args)
         .current_dir(workdir)
+        // Started from inside a git hook these point at another repo or
+        // index; libgit2 ignores them, so the CLI must too.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(if stdin.is_some() {
             Stdio::piped()
