@@ -7,16 +7,20 @@ use crossterm::event::KeyCode;
 use git_tui_core::branch::BranchInfo;
 use git_tui_core::diff::FileDiff;
 use git_tui_core::error::GitError;
-use git_tui_core::jobqueue::{AsyncJob, AsyncResult, JobQueue};
+use git_tui_core::jobqueue::{AsyncJob, AsyncResult, JobId, JobQueue};
 use git_tui_core::llm::LlmConfig;
 use git_tui_core::log::{CommitInfo, CommitOverview};
 use git_tui_core::stash::StashEntry;
 use git_tui_core::status::{FileState, RepoStatus, StatusEntry};
 use git_tui_core::sync::SyncStatus;
-use std::cell::Cell;
+use ratatui::layout::Rect;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::config::{Config, KeyBindings, Theme};
 use crate::fuzzy;
+use crate::input::Chord;
 use crate::menu::{MenuAction, MenuEntry, WorkspaceRequest};
 use crate::ui::{
     cursor_line_text, diff_rows, footer_button_at, footer_buttons, panel_divider_ys,
@@ -65,6 +69,76 @@ pub enum Mode {
     /// Actions menu (`?`): a searchable list of every action. The draft is
     /// the filter; Enter runs the highlighted entry.
     ActionMenu,
+    /// Yes/no box before an action that throws work away (see
+    /// [`Danger`]). Enter or `y` runs it, Esc or `n` backs out.
+    Confirm,
+}
+
+/// What kind of job a pending result belongs to, so a failure can be
+/// handled where it matters (a failed commit gives the message back, a
+/// failed push stops "pushing…") instead of every error clearing
+/// everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    Commit,
+    /// Changes the repository: stage, discard, branch, stash.
+    Mutation,
+    /// Push, pull, publish.
+    Sync,
+    Generate,
+    Other,
+}
+
+/// A request to throw work away, as the user expressed it. It is resolved
+/// against the current selection into a concrete [`DangerAction`] before
+/// anything is confirmed, so the box names exactly what will be affected
+/// and a list that changes underneath cannot redirect it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Danger {
+    /// The selected file, or everything under the selected folder.
+    DiscardSelected,
+    /// The file open in the fullscreen diff.
+    DiscardLoaded,
+    RestoreHunk,
+    DeleteBranch,
+    DropStash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DangerAction {
+    DiscardFiles(Vec<String>),
+    RestoreHunk {
+        path: String,
+        hunk_index: usize,
+        staged: bool,
+    },
+    DeleteBranch(String),
+    DropStash(usize),
+}
+
+struct Confirm {
+    action: DangerAction,
+    prompt: String,
+    /// Mode to return to (the main view or the fullscreen diff).
+    back: Mode,
+    opened: Instant,
+}
+
+/// How long a confirm box ignores Enter after opening. A paste or a key
+/// burst that happens to contain `d` and a newline must not confirm the
+/// box it just opened; a person needs longer than this to read it anyway.
+const CONFIRM_ARM: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_millis(250)
+};
+
+/// What a click on a button drawn inside a popup does: the same as the key
+/// (or chord) printed next to it, so mouse and keyboard share one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UiClick {
+    Key(KeyCode),
+    Chord(Chord),
 }
 
 /// Which panel receives navigation keys. Everything is vertical: Tab cycles
@@ -263,9 +337,29 @@ pub struct App {
     /// Actions menu: highlighted row among the filtered entries, and
     /// whether a destructive entry is waiting for its second Enter.
     menu_selected: usize,
-    menu_confirm: bool,
     /// A menu action only the workspace can run (it owns the tabs).
     workspace_request: Option<WorkspaceRequest>,
+    /// Kind of each job still waiting for its result.
+    inflight: HashMap<JobId, Pending>,
+    /// The error line came from a failed job: the status refresh that
+    /// follows must not wipe it before the user has read it.
+    error_sticky: bool,
+    /// Commit message kept while the box is closed: after Esc, and after
+    /// Enter until the commit is known to have succeeded.
+    commit_stash: String,
+    /// The draft as it was when message generation started; a result only
+    /// replaces the box if the user has not typed since.
+    gen_draft: Option<String>,
+    confirm: Option<Confirm>,
+    /// `[ui] confirm_destructive`.
+    confirm_destructive: bool,
+    /// Buttons drawn by the open popup this frame, and the popup's area
+    /// (a click outside a list popup closes it).
+    clicks: RefCell<Vec<(Rect, UiClick)>>,
+    modal_rect: Cell<Option<Rect>>,
+    /// Keys produced by clicks while the workspace owns the keyboard
+    /// (project browser, init confirm); it replays them.
+    workspace_keys: Vec<KeyCode>,
     /// Theme picker: highlighted row (index into [`Theme::names`]) and the
     /// theme to restore on Esc.
     theme_selected: usize,
@@ -616,8 +710,16 @@ impl App {
             theme_hit: std::cell::RefCell::new(Vec::new()),
             menu_hit: std::cell::RefCell::new(Vec::new()),
             menu_selected: 0,
-            menu_confirm: false,
             workspace_request: None,
+            inflight: HashMap::new(),
+            error_sticky: false,
+            commit_stash: String::new(),
+            gen_draft: None,
+            confirm: None,
+            confirm_destructive: config.ui.confirm_destructive,
+            clicks: RefCell::new(Vec::new()),
+            modal_rect: Cell::new(None),
+            workspace_keys: Vec::new(),
             theme_selected: 0,
             theme_before: config.theme,
             browser_hit: std::cell::RefCell::new(Vec::new()),
@@ -1054,7 +1156,6 @@ impl App {
         self.draft.clear();
         self.draft_cursor = 0;
         self.menu_selected = 0;
-        self.menu_confirm = false;
         self.error = None;
         self.notice = None;
     }
@@ -1090,35 +1191,6 @@ impl App {
         self.menu_selected
     }
 
-    /// The destructive entry waiting for a second Enter, with what it will
-    /// act on (the selection behind the menu), for the confirm line.
-    pub(crate) fn menu_confirming(&self) -> Option<(MenuEntry, String)> {
-        if !self.menu_confirm {
-            return None;
-        }
-        let entry = *self.menu_matches().get(self.menu_selected)?;
-        Some((entry, self.menu_target(entry.action).unwrap_or_default()))
-    }
-
-    fn menu_target(&self, action: MenuAction) -> Option<String> {
-        let MenuAction::Footer(action) = action else {
-            return None;
-        };
-        match action {
-            FooterAction::Discard => match self.cursor_dir() {
-                Some(dir) => Some(format!("{dir}/")),
-                None => self.selected_file().map(|e| e.path.clone()),
-            },
-            FooterAction::RestoreHunk => self
-                .diff
-                .as_ref()
-                .map(|d| format!("hunk {} of {}", self.hunk + 1, d.path)),
-            FooterAction::DeleteBranch => self.selected_branch().map(|b| b.name),
-            FooterAction::StashDrop => self.selected_stash().map(|s| s.message),
-            _ => None,
-        }
-    }
-
     fn menu_move(&mut self, delta: isize) {
         let count = self.menu_matches().len() as isize;
         if count > 0 {
@@ -1130,19 +1202,14 @@ impl App {
         self.mode = Mode::Normal;
         self.draft.clear();
         self.draft_cursor = 0;
-        self.menu_confirm = false;
     }
 
-    /// Enter: run the highlighted entry. A destructive one arms the confirm
-    /// line first and only runs on the next Enter.
+    /// Enter: run the highlighted entry. Destructive ones go through the
+    /// same confirm box as their keys (see [`Self::request_danger`]).
     fn activate_menu_entry(&mut self) {
         let Some(entry) = self.menu_matches().get(self.menu_selected).copied() else {
             return;
         };
-        if entry.destructive && !self.menu_confirm {
-            self.menu_confirm = true;
-            return;
-        }
         self.close_action_menu();
         self.run_menu_action(entry.action);
     }
@@ -1162,7 +1229,7 @@ impl App {
                 self.click_footer_button(FooterAction::StashPush);
             }
             MenuAction::Footer(action) => self.click_footer_button(action),
-            MenuAction::Refresh => self.refresh(),
+            MenuAction::Refresh => self.refresh_all(),
             MenuAction::MarkdownPreview => self.toggle_markdown_preview(),
             MenuAction::LlmSettings => self.begin_llm_settings(),
             MenuAction::Focus(focus) => {
@@ -1182,16 +1249,8 @@ impl App {
     }
 
     /// Keys inside the actions menu: typing filters, `↑/↓` move, Enter
-    /// runs. While a destructive entry waits for confirmation, Enter
-    /// confirms and every other key backs out of the confirmation only.
+    /// runs.
     fn on_key_action_menu(&mut self, key: KeyCode) {
-        if self.menu_confirm {
-            match key {
-                KeyCode::Enter => self.activate_menu_entry(),
-                _ => self.menu_confirm = false,
-            }
-            return;
-        }
         match key {
             KeyCode::Up | KeyCode::BackTab => self.menu_move(-1),
             KeyCode::Down | KeyCode::Tab => self.menu_move(1),
@@ -1218,18 +1277,15 @@ impl App {
     }
 
     /// Click a menu row: select it, or run it when it is already selected
-    /// (mouse double-click without a timer). Clicking elsewhere backs out
-    /// of a pending confirmation.
+    /// (mouse double-click without a timer).
     fn click_action_menu(&mut self, row: u16) {
         let Some(index) = self.hit(HitMap::ActionMenu, row) else {
-            self.menu_confirm = false;
             return;
         };
         if index == self.menu_selected {
             self.activate_menu_entry();
         } else {
             self.menu_selected = index;
-            self.menu_confirm = false;
         }
     }
 
@@ -1335,7 +1391,7 @@ impl App {
         self.md_for = target.clone();
         self.md_text = None;
         if let Some((path, staged)) = target {
-            if let Err(e) = self.queue.submit(AsyncJob::LoadMarkdown { path, staged }) {
+            if let Err(e) = self.submit_job(AsyncJob::LoadMarkdown { path, staged }) {
                 self.error = Some(e.to_string());
             }
         }
@@ -1645,7 +1701,7 @@ impl App {
         }
         self.llm_models_loading = true;
         let id = self.llm_models_request;
-        if let Err(e) = self.queue.submit(AsyncJob::FetchModels { id, llm: cfg }) {
+        if let Err(e) = self.submit_job(AsyncJob::FetchModels { id, llm: cfg }) {
             self.llm_models_loading = false;
             self.error = Some(e.to_string());
         }
@@ -1837,11 +1893,13 @@ impl App {
             return;
         }
         self.generating = true;
+        self.gen_draft = Some(self.draft.clone());
         self.error = None;
-        if let Err(e) = self.queue.submit(AsyncJob::GenerateCommitMessage {
+        if let Err(e) = self.submit_job(AsyncJob::GenerateCommitMessage {
             llm: self.llm.clone(),
         }) {
             self.generating = false;
+            self.gen_draft = None;
             self.error = Some(e.to_string());
         }
     }
@@ -1908,7 +1966,7 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        if let Err(e) = self.queue.submit(AsyncJob::RefreshStatus) {
+        if let Err(e) = self.submit_job(AsyncJob::RefreshStatus) {
             self.error = Some(e.to_string());
         }
     }
@@ -1928,7 +1986,7 @@ impl App {
             AsyncJob::LoadSync,
         ];
         for job in jobs {
-            if let Err(e) = self.queue.submit(job) {
+            if let Err(e) = self.submit_job(job) {
                 self.error = Some(e.to_string());
                 return;
             }
@@ -1947,20 +2005,12 @@ impl App {
         self.on_key_with_modifiers(key, shift);
     }
 
-    /// Modifier-aware dispatch (the event loop calls this). Only Shift+A
-    /// generates a message in the commit box, so a literal `A` (caps lock
-    /// or otherwise without Shift) still types normally. Shift+Down/Up
+    /// Modifier-aware dispatch (the event loop calls this). Shift+Down/Up
     /// mirror `J`/`K` (hunk jumps) in Normal and FullDiff modes; text
-    /// modals and the finder keep plain arrow-key behavior.
+    /// modals and the finder keep plain arrow-key behavior. Keys pressed
+    /// with Ctrl or Alt never arrive here: see [`Self::on_chord`].
     pub fn on_key_with_modifiers(&mut self, key: KeyCode, shift_held: bool) {
-        // A new action dismisses the previous error/notice; async failures
-        // from this action arrive later via `poll` and replace them.
-        self.error = None;
-        self.notice = None;
-        if self.mode == Mode::Committing && matches!(key, KeyCode::Char('a' | 'A')) && shift_held {
-            self.begin_generate_commit_message();
-            return;
-        }
+        self.clear_messages();
         // Shift+Right in the file list jumps to the right-side diff
         // preview (plain Right expands folders, so it must stay put).
         if self.mode == Mode::Normal
@@ -1989,7 +2039,283 @@ impl App {
         self.on_key_inner(key);
     }
 
+    /// Whether the current mode is editing [`Self::draft`] as text.
+    fn has_text_input(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Committing
+                | Mode::NewBranch
+                | Mode::StashPush
+                | Mode::SetUpstream
+                | Mode::SetRemote
+                | Mode::FindFile
+                | Mode::LlmSettings
+                | Mode::ActionMenu
+        )
+    }
+
+    /// A key pressed with Ctrl or Alt. In text boxes these are the usual
+    /// readline editing keys; elsewhere a few navigation shortcuts. Unknown
+    /// combinations do nothing (they never fall back to the bare key).
+    pub fn on_chord(&mut self, chord: Chord) {
+        self.clear_messages();
+        // Ctrl+N / Ctrl+P are Down / Up everywhere.
+        match chord {
+            Chord::Ctrl('n') => return self.on_key_inner(KeyCode::Down),
+            Chord::Ctrl('p') => return self.on_key_inner(KeyCode::Up),
+            _ => {}
+        }
+        if self.has_text_input() {
+            self.on_chord_text(chord);
+            return;
+        }
+        if matches!(self.mode, Mode::Normal | Mode::FullDiff) {
+            match chord {
+                Chord::Ctrl('l') if self.mode == Mode::Normal => self.refresh_all(),
+                Chord::Ctrl('d') => self.page(1, true),
+                Chord::Ctrl('u') => self.page(-1, true),
+                _ => {}
+            }
+        }
+    }
+
+    fn on_chord_text(&mut self, chord: Chord) {
+        match chord {
+            Chord::Ctrl('w' | 'h') | Chord::DeleteWord => self.delete_draft_word_before(),
+            Chord::Ctrl('u') => {
+                let byte = self.draft_byte_index();
+                // In the commit box only the current line goes.
+                let start = self.draft[..byte].rfind('\n').map_or(0, |i| i + 1);
+                let removed = self.draft[start..byte].chars().count();
+                self.draft.drain(start..byte);
+                self.draft_cursor = self.draft_cursor() - removed;
+            }
+            Chord::Ctrl('k') => {
+                let byte = self.draft_byte_index();
+                let end = self.draft[byte..]
+                    .find('\n')
+                    .map_or(self.draft.len(), |i| byte + i);
+                self.draft.drain(byte..end);
+            }
+            Chord::Ctrl('a') => self.move_draft_home(),
+            Chord::Ctrl('e') => self.move_draft_end(),
+            Chord::WordLeft | Chord::Alt('b') => self.draft_cursor = self.draft_word_start(),
+            Chord::WordRight | Chord::Alt('f') => self.draft_cursor = self.draft_word_end(),
+            Chord::Ctrl('g') if self.mode == Mode::Committing => {
+                return self.begin_generate_commit_message()
+            }
+            Chord::Newline | Chord::Ctrl('j') if self.mode == Mode::Committing => {
+                self.insert_draft_char('\n')
+            }
+            _ => return,
+        }
+        self.after_draft_edit();
+    }
+
+    /// Char index where the word before the cursor starts.
+    fn draft_word_start(&self) -> usize {
+        let chars: Vec<char> = self.draft.chars().collect();
+        let mut i = self.draft_cursor().min(chars.len());
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Char index just past the word after the cursor.
+    fn draft_word_end(&self) -> usize {
+        let chars: Vec<char> = self.draft.chars().collect();
+        let mut i = self.draft_cursor().min(chars.len());
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    /// Ctrl+W: delete back to the start of the word before the cursor.
+    fn delete_draft_word_before(&mut self) {
+        let start = self.draft_word_start();
+        let end = self.draft_cursor();
+        let byte_of = |index: usize| {
+            self.draft
+                .char_indices()
+                .nth(index)
+                .map_or(self.draft.len(), |(b, _)| b)
+        };
+        let (from, to) = (byte_of(start), byte_of(end));
+        self.draft.drain(from..to);
+        self.draft_cursor = start;
+    }
+
+    /// What each text box does after its text changed.
+    fn after_draft_edit(&mut self) {
+        match self.mode {
+            Mode::FindFile => self.finder_selected = 0,
+            Mode::ActionMenu => self.menu_selected = 0,
+            Mode::LlmSettings => {
+                if matches!(self.llm_selected(), 0 | 2 | 3) {
+                    self.refresh_llm_models();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pasted text. It only ever becomes text: in the commit box with its
+    /// line breaks, in one-line boxes joined onto one line, and nowhere
+    /// else (a paste into the file list must not run as commands).
+    pub fn on_paste(&mut self, text: &str) {
+        self.clear_messages();
+        if !self.has_text_input() {
+            self.notice =
+                Some("paste ignored: open a text box first (c for the commit box)".into());
+            return;
+        }
+        let multiline = self.mode == Mode::Committing;
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        // A trailing line break is how a copied line ends, not a request
+        // to submit.
+        for c in text.trim_end_matches('\n').chars() {
+            match c {
+                '\n' if multiline => self.insert_draft_char('\n'),
+                '\n' | '\t' => self.insert_draft_char(' '),
+                c if c.is_control() => {}
+                c => self.insert_draft_char(c),
+            }
+        }
+        self.after_draft_edit();
+    }
+
+    /// Reload status and the side panels without blanking the diff: used
+    /// when the terminal regains focus, where usually nothing changed and
+    /// a "loading…" flash would only be noise. A changed file list still
+    /// reloads the diff through the normal target check.
+    pub fn refresh_quietly(&mut self) {
+        self.refresh();
+        self.reload_branches();
+        self.reload_log();
+        self.reload_stash();
+        self.reload_sync();
+        // Same file, new content: the target is unchanged, so ask again.
+        self.reload_open_diff();
+    }
+
+    /// Re-request the diff that is currently shown, keeping it on screen
+    /// until the fresh one arrives.
+    fn reload_open_diff(&mut self) {
+        let Some((path, staged)) = self.diff_for.clone() else {
+            return;
+        };
+        let job = if self.diff_whole_file {
+            AsyncJob::LoadFile { path }
+        } else {
+            AsyncJob::LoadDiff { path, staged }
+        };
+        if let Err(e) = self.submit_job(job) {
+            self.error = Some(e.to_string());
+        }
+    }
+
+    /// `r` / Ctrl+L: reload everything shown, not only the file list.
+    pub fn refresh_all(&mut self) {
+        self.reload_after_change();
+    }
+
+    /// Page the focused view: half a screen for Ctrl+D / Ctrl+U.
+    fn page(&mut self, direction: isize, half: bool) {
+        let rows: isize = if half { 10 } else { 20 };
+        let delta = direction * rows;
+        if self.mode == Mode::FullDiff {
+            self.move_cursor_or_scroll(delta);
+        } else if self.focus == Focus::Diff && !self.show_markdown_preview() {
+            self.move_cursor(delta);
+        } else {
+            self.scroll_diff_by(delta);
+        }
+    }
+
+    /// Start of a frame: forget last frame's popup buttons.
+    pub(crate) fn begin_frame(&self) {
+        self.clicks.borrow_mut().clear();
+        self.modal_rect.set(None);
+    }
+
+    /// Record the open popup's area (a click outside closes list popups).
+    pub(crate) fn set_modal_rect(&self, rect: Rect) {
+        self.modal_rect.set(Some(rect));
+    }
+
+    /// Record a button drawn inside the open popup.
+    pub(crate) fn add_click(&self, rect: Rect, click: UiClick) {
+        self.clicks.borrow_mut().push((rect, click));
+    }
+
+    /// A key the mouse produced. Modes the workspace owns get it there.
+    fn press(&mut self, key: KeyCode) {
+        if matches!(self.mode, Mode::OpenProject | Mode::ConfirmInit) {
+            self.workspace_keys.push(key);
+        } else {
+            self.on_key_with_modifiers(key, false);
+        }
+    }
+
+    /// Keys for the workspace to replay (see [`Self::press`]).
+    pub(crate) fn take_workspace_keys(&mut self) -> Vec<KeyCode> {
+        std::mem::take(&mut self.workspace_keys)
+    }
+
+    /// Popup handling shared by every mode with one open: buttons first,
+    /// then "click outside closes" for the popups where closing loses
+    /// nothing. Returns whether the click was consumed.
+    fn click_popup(&mut self, col: u16, row: u16) -> bool {
+        let button = self
+            .clicks
+            .borrow()
+            .iter()
+            .find(|(rect, _)| mouse_in(col, row, *rect))
+            .map(|(_, click)| *click);
+        if let Some(click) = button {
+            match click {
+                UiClick::Key(key) => self.press(key),
+                UiClick::Chord(chord) => self.on_chord(chord),
+            }
+            return true;
+        }
+        let outside = self
+            .modal_rect
+            .get()
+            .is_some_and(|rect| !mouse_in(col, row, rect));
+        let closes_on_outside = matches!(
+            self.mode,
+            Mode::FindFile
+                | Mode::ThemePicker
+                | Mode::ActionMenu
+                | Mode::Confirm
+                | Mode::ConfirmPush
+                | Mode::Committing
+        );
+        if outside && closes_on_outside {
+            self.press(KeyCode::Esc);
+            return true;
+        }
+        false
+    }
+
     fn on_key_inner(&mut self, key: KeyCode) {
+        if self.mode == Mode::Confirm {
+            match key {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => self.accept_confirm(),
+                KeyCode::Esc | KeyCode::Char('n' | 'N' | 'q') => self.cancel_confirm(),
+                _ => {}
+            }
+            return;
+        }
         if self.mode == Mode::LlmSettings {
             // Shift+A must not leak generation in here: the form owns every
             // key until Enter saves or Esc cancels.
@@ -2078,14 +2404,20 @@ impl App {
                     | Mode::ConfirmPush
                     | Mode::LlmSettings
                     | Mode::ThemePicker
-                    | Mode::ActionMenu => {}
+                    | Mode::ActionMenu
+                    | Mode::Confirm => {}
                 },
                 KeyCode::Esc => {
+                    if self.mode == Mode::Committing {
+                        // Closing the box is not throwing the text away.
+                        self.commit_stash = std::mem::take(&mut self.draft);
+                    }
                     self.mode = match self.mode {
                         Mode::SetUpstream | Mode::SetRemote => self.sync_return,
                         _ => Mode::Normal,
                     };
                     self.draft.clear();
+                    self.draft_cursor = 0;
                 }
                 _ => {}
             }
@@ -2166,7 +2498,7 @@ impl App {
             && self.focus == Focus::Diff
         {
             // Restore the hunk under the cursor (revert just that hunk).
-            self.discard_selected_hunk();
+            self.request_danger(Danger::RestoreHunk);
         } else if k.checkout.contains(&key) && self.focus == Focus::Branches {
             self.checkout_selected_branch();
         } else if k.stash_pop.contains(&key) && self.focus == Focus::Stash {
@@ -2185,7 +2517,7 @@ impl App {
             }
         } else if k.discard.contains(&key) {
             if self.focus == Focus::Status {
-                self.discard_selected();
+                self.request_danger(Danger::DiscardSelected);
             }
         } else if k.branch_new.contains(&key) && self.focus == Focus::Branches {
             self.mode = Mode::NewBranch;
@@ -2194,9 +2526,9 @@ impl App {
             self.mode = Mode::StashPush;
             self.draft.clear();
         } else if k.branch_delete.contains(&key) && self.focus == Focus::Branches {
-            self.delete_selected_branch();
+            self.request_danger(Danger::DeleteBranch);
         } else if k.stash_drop.contains(&key) && self.focus == Focus::Stash {
-            self.drop_selected_stash();
+            self.request_danger(Danger::DropStash);
         } else if k.scroll_up.contains(&key) {
             if self.focus == Focus::Diff && !self.show_markdown_preview() {
                 self.move_cursor(-10);
@@ -2210,8 +2542,7 @@ impl App {
                 self.scroll_diff_by(10);
             }
         } else if k.commit.contains(&key) {
-            self.mode = Mode::Committing;
-            self.draft.clear();
+            self.open_commit_box();
         } else if k.toggle_markdown_preview.contains(&key) {
             self.toggle_markdown_preview();
         } else if k.llm_settings.contains(&key) {
@@ -2223,7 +2554,7 @@ impl App {
         } else if k.find_files.contains(&key) {
             self.open_finder();
         } else if k.refresh.contains(&key) {
-            self.refresh();
+            self.refresh_all();
         } else if k.sync_pull.contains(&key) {
             self.start_pull();
         } else if k.sync_push.contains(&key) {
@@ -2278,9 +2609,14 @@ impl App {
         } else if k.stage.contains(&key) {
             self.stage_selected_hunk();
         } else if key == KeyCode::Char('x') || key == KeyCode::Char('X') {
-            self.discard_selected_hunk();
+            self.request_danger(Danger::RestoreHunk);
         } else if k.discard.contains(&key) {
-            self.discard_loaded_file();
+            self.request_danger(Danger::DiscardLoaded);
+        } else if k.project_close.contains(&key) && !k.quit.contains(&key) {
+            // `q` closes what is in front: the diff, not the project.
+            self.mode = Mode::Normal;
+            self.visual = None;
+            self.snap_scroll_to_cursor();
         } else if k.scroll_up.contains(&key) {
             self.move_cursor_or_scroll(-10);
         } else if k.scroll_down.contains(&key) {
@@ -2587,6 +2923,9 @@ impl App {
     /// keyboard (commit, branch, stash, LLM, push/pull prompts), except
     /// the push confirm box, whose buttons are clickable.
     pub fn on_mouse_down(&mut self, col: u16, row: u16) {
+        if !matches!(self.mode, Mode::Normal | Mode::FullDiff) && self.click_popup(col, row) {
+            return;
+        }
         match self.mode {
             Mode::FindFile => {
                 self.click_finder(row);
@@ -2948,15 +3287,14 @@ impl App {
             }
             FooterAction::Discard => {
                 if self.mode == Mode::FullDiff {
-                    self.discard_loaded_file();
+                    self.request_danger(Danger::DiscardLoaded);
                 } else if self.focus == Focus::Status {
-                    self.discard_selected();
+                    self.request_danger(Danger::DiscardSelected);
                 }
             }
             FooterAction::Commit => {
                 if self.mode == Mode::Normal {
-                    self.mode = Mode::Committing;
-                    self.draft.clear();
+                    self.open_commit_box();
                 }
             }
             FooterAction::Pull => self.start_pull(),
@@ -2972,7 +3310,7 @@ impl App {
                 }
             }
             FooterAction::StageHunk => self.stage_selected_hunk(),
-            FooterAction::RestoreHunk => self.discard_selected_hunk(),
+            FooterAction::RestoreHunk => self.request_danger(Danger::RestoreHunk),
             FooterAction::Checkout => {
                 if self.focus == Focus::Branches {
                     self.checkout_selected_branch();
@@ -2986,7 +3324,7 @@ impl App {
             }
             FooterAction::DeleteBranch => {
                 if self.focus == Focus::Branches {
-                    self.delete_selected_branch();
+                    self.request_danger(Danger::DeleteBranch);
                 }
             }
             FooterAction::StashPop => {
@@ -3002,7 +3340,7 @@ impl App {
             }
             FooterAction::StashDrop => {
                 if self.focus == Focus::Stash {
-                    self.drop_selected_stash();
+                    self.request_danger(Danger::DropStash);
                 }
             }
         }
@@ -3321,10 +3659,7 @@ impl App {
         }
         self.commit_overview_for = Some(commit.oid.clone());
         self.commit_overview = None;
-        if let Err(e) = self
-            .queue
-            .submit(AsyncJob::LoadCommitOverview { oid: commit.oid })
-        {
+        if let Err(e) = self.submit_job(AsyncJob::LoadCommitOverview { oid: commit.oid }) {
             self.error = Some(e.to_string());
         }
     }
@@ -3380,7 +3715,7 @@ impl App {
                 path: file.path.clone(),
             }
         };
-        if let Err(e) = self.queue.submit(job) {
+        if let Err(e) = self.submit_job(job) {
             self.error = Some(e.to_string());
         }
     }
@@ -3408,7 +3743,7 @@ impl App {
             .collect();
         if !to_stage.is_empty() {
             for path in to_stage {
-                if let Err(e) = self.queue.submit(AsyncJob::StageFile { path }) {
+                if let Err(e) = self.submit_job(AsyncJob::StageFile { path }) {
                     self.error = Some(e.to_string());
                     return;
                 }
@@ -3422,7 +3757,7 @@ impl App {
             .collect();
         if !staged.is_empty() {
             for path in staged {
-                if let Err(e) = self.queue.submit(AsyncJob::UnstageFile { path }) {
+                if let Err(e) = self.submit_job(AsyncJob::UnstageFile { path }) {
                     self.error = Some(e.to_string());
                     return;
                 }
@@ -3437,112 +3772,109 @@ impl App {
     /// highlight sits on a directory header, open (`▼`, `dir_cursor`) or
     /// collapsed (the selected file is hidden inside it), every changed
     /// file beneath it is discarded so the folder is clean again.
-    fn discard_selected(&mut self) {
-        if let Some(dir) = self.cursor_dir().map(str::to_string) {
-            self.discard_dir(&dir);
-            return;
+    fn plan_discard_selected(&self) -> Result<(DangerAction, String), String> {
+        if let Some(dir) = self.cursor_dir() {
+            return self.plan_discard_dir(dir);
         }
-        let Some(file) = self.selected_file().cloned() else {
-            return;
+        let Some(file) = self.selected_file() else {
+            return Err("no file selected".into());
         };
-        if let Some(dir) = self.collapsed_dir_for(&file.path) {
-            self.discard_dir(&dir);
-        } else {
-            self.discard_file_entry(&file);
+        match self.collapsed_dir_for(&file.path) {
+            Some(dir) => self.plan_discard_dir(&dir),
+            None => Self::plan_discard_file(file),
         }
     }
 
-    /// `d` on one visible file: discard its changes (or delete it when
+    /// One visible file: discard its changes (or delete it when
     /// untracked / staged-new).
-    fn discard_file_entry(&mut self, file: &StatusEntry) {
-        if file.state == FileState::Conflicted {
-            self.error = Some(format!(
-                "conflicted: resolve markers in {} first",
-                file.path
-            ));
-            return;
-        }
-        if file.state == FileState::Clean {
-            self.error = Some(format!("{} is unchanged — nothing to discard", file.path));
-            return;
-        }
-        if let Err(e) = self.queue.submit(AsyncJob::DiscardFile {
-            path: file.path.clone(),
-        }) {
-            self.error = Some(e.to_string());
-        }
+    fn plan_discard_file(file: &StatusEntry) -> Result<(DangerAction, String), String> {
+        let prompt = match file.state {
+            FileState::Conflicted => {
+                return Err(format!(
+                    "conflicted: resolve markers in {} first",
+                    file.path
+                ))
+            }
+            FileState::Clean => {
+                return Err(format!("{} is unchanged — nothing to discard", file.path))
+            }
+            FileState::Untracked => format!("Delete untracked file {}?", file.path),
+            _ => format!("Discard all changes to {}?", file.path),
+        };
+        Ok((DangerAction::DiscardFiles(vec![file.path.clone()]), prompt))
     }
 
-    /// `d` on a directory header: discard every changed file beneath it.
-    /// Conflicted files abort the whole directory like the single-file
-    /// case; clean files are skipped silently.
-    fn discard_dir(&mut self, dir: &str) {
+    /// A directory header: every changed file beneath it. A conflicted
+    /// file refuses the whole directory like the single-file case; clean
+    /// files are skipped silently.
+    fn plan_discard_dir(&self, dir: &str) -> Result<(DangerAction, String), String> {
         let prefix = format!("{dir}/");
-        let under: Vec<(String, FileState)> = self
+        let under: Vec<&StatusEntry> = self
             .file_list
             .iter()
             .filter(|e| e.path.starts_with(&prefix))
-            .map(|e| (e.path.clone(), e.state))
             .collect();
-        if let Some((path, _)) = under.iter().find(|(_, s)| *s == FileState::Conflicted) {
-            self.error = Some(format!("conflicted: resolve markers in {path} first"));
-            return;
+        if let Some(e) = under.iter().find(|e| e.state == FileState::Conflicted) {
+            return Err(format!("conflicted: resolve markers in {} first", e.path));
         }
         let dirty: Vec<String> = under
             .iter()
-            .filter(|(_, s)| !matches!(s, FileState::Clean))
-            .map(|(p, _)| p.clone())
+            .filter(|e| e.state != FileState::Clean)
+            .map(|e| e.path.clone())
             .collect();
         if dirty.is_empty() {
-            self.error = Some(format!("nothing to discard under {dir}/"));
-            return;
+            return Err(format!("nothing to discard under {dir}/"));
         }
-        for path in dirty {
-            if let Err(e) = self.queue.submit(AsyncJob::DiscardFile { path }) {
-                self.error = Some(e.to_string());
-                return;
+        let untracked = under
+            .iter()
+            .filter(|e| e.state == FileState::Untracked)
+            .count();
+        let mut prompt = format!(
+            "Discard changes to {} file{} under {dir}/?",
+            dirty.len(),
+            if dirty.len() == 1 { "" } else { "s" }
+        );
+        if untracked > 0 {
+            prompt.push_str(&format!(" {untracked} untracked will be deleted."));
+        }
+        Ok((DangerAction::DiscardFiles(dirty), prompt))
+    }
+
+    /// The file open in the fullscreen diff.
+    fn plan_discard_loaded(&self) -> Result<(DangerAction, String), String> {
+        let Some((path, _)) = self.diff_for.clone() else {
+            return Err("no diff loaded".into());
+        };
+        // The file list knows the state (clean vs changed), including
+        // mode-only changes shown via the whole-file fallback.
+        match self.file_list.iter().find(|f| f.path == path) {
+            Some(file) => Self::plan_discard_file(file),
+            None => {
+                let prompt = format!("Discard all changes to {path}?");
+                Ok((DangerAction::DiscardFiles(vec![path]), prompt))
             }
         }
     }
 
-    /// `d` in the fullscreen diff: discard the loaded file's changes.
-    fn discard_loaded_file(&mut self) {
-        let Some((path, _)) = self.diff_for.clone() else {
-            self.error = Some("no diff loaded".into());
-            return;
-        };
-        // The file list knows the state (clean vs changed), including
-        // mode-only changes shown via the whole-file fallback.
-        if let Some(file) = self.file_list.iter().find(|f| f.path == path).cloned() {
-            self.discard_file_entry(&file);
-        } else if let Err(e) = self.queue.submit(AsyncJob::DiscardFile { path }) {
-            self.error = Some(e.to_string());
-        }
-    }
-
-    /// `x` in the diff (preview or fullscreen): restore the hunk under
-    /// the cursor, reverting just that hunk's region while leaving every
-    /// other hunk untouched. Unstaged hunks revert the workdir toward the
-    /// index; staged hunks revert the index toward HEAD.
-    fn discard_selected_hunk(&mut self) {
+    /// The hunk under the cursor (preview or fullscreen): reverting just
+    /// that hunk's region leaves every other hunk untouched. Unstaged
+    /// hunks revert the workdir toward the index; staged hunks revert the
+    /// index toward HEAD.
+    fn plan_restore_hunk(&self) -> Result<(DangerAction, String), String> {
         if self.show_markdown_preview() {
-            return;
+            return Err("leave the Markdown preview (m) to restore a hunk".into());
         }
         let Some((path, staged)) = self.diff_for.clone() else {
-            self.error = Some("no diff loaded".into());
-            return;
+            return Err("no diff loaded".into());
         };
         if self.diff_whole_file {
-            self.error = Some("nothing to restore: file has no hunks".into());
-            return;
+            return Err("nothing to restore: file has no hunks".into());
         }
         let Some(diff) = self.diff.as_ref() else {
-            self.error = Some("no diff loaded".into());
-            return;
+            return Err("no diff loaded".into());
         };
         if diff.binary {
-            self.error = Some("cannot restore hunk of binary file".into());
-            return;
+            return Err("cannot restore hunk of binary file".into());
         }
         let has_changes = diff.hunks.get(self.hunk).is_some_and(|h| {
             h.lines.iter().any(|l| {
@@ -3551,16 +3883,132 @@ impl App {
             })
         });
         if !has_changes {
-            self.error = Some("nothing to restore in this hunk".into());
+            return Err("nothing to restore in this hunk".into());
+        }
+        let prompt = format!(
+            "Restore hunk {} of {path}? Its changes are thrown away.",
+            self.hunk + 1
+        );
+        Ok((
+            DangerAction::RestoreHunk {
+                path,
+                hunk_index: self.hunk,
+                staged,
+            },
+            prompt,
+        ))
+    }
+
+    fn plan_delete_branch(&self) -> Result<(DangerAction, String), String> {
+        let Some(branch) = self.selected_branch() else {
+            return Err("no branch selected".into());
+        };
+        let prompt = format!(
+            "Delete branch {}? This is a forced delete, merged or not.",
+            branch.name
+        );
+        Ok((DangerAction::DeleteBranch(branch.name), prompt))
+    }
+
+    fn plan_drop_stash(&self) -> Result<(DangerAction, String), String> {
+        let Some(entry) = self.selected_stash() else {
+            return Err("no stash selected".into());
+        };
+        let prompt = format!("Drop stash \"{}\"?", entry.message);
+        Ok((DangerAction::DropStash(entry.index), prompt))
+    }
+
+    /// Ask to throw work away. Resolves the request against the current
+    /// selection, then either opens the confirm box naming the target or,
+    /// with `[ui] confirm_destructive = false`, runs it at once.
+    pub(crate) fn request_danger(&mut self, danger: Danger) {
+        let plan = match danger {
+            Danger::DiscardSelected => self.plan_discard_selected(),
+            Danger::DiscardLoaded => self.plan_discard_loaded(),
+            Danger::RestoreHunk => self.plan_restore_hunk(),
+            Danger::DeleteBranch => self.plan_delete_branch(),
+            Danger::DropStash => self.plan_drop_stash(),
+        };
+        let (action, prompt) = match plan {
+            Ok(plan) => plan,
+            Err(message) => {
+                self.error = Some(message);
+                return;
+            }
+        };
+        // Reverting a staged hunk only edits the index: the change stays
+        // in the working tree, so there is nothing to lose.
+        let harmless = matches!(action, DangerAction::RestoreHunk { staged: true, .. });
+        if self.confirm_destructive && !harmless {
+            self.confirm = Some(Confirm {
+                action,
+                prompt,
+                back: self.mode,
+                opened: Instant::now(),
+            });
+            self.mode = Mode::Confirm;
+        } else if self.mutation_in_flight() {
+            // The list is about to change under the cursor: a second press
+            // would otherwise land on whatever moves into this row.
+            self.notice = Some("wait: the previous change is still being applied".into());
+        } else {
+            self.run_danger(action);
+        }
+    }
+
+    /// The question the confirm box is asking, while it is open.
+    pub fn confirm_prompt(&self) -> Option<&str> {
+        self.confirm.as_ref().map(|c| c.prompt.as_str())
+    }
+
+    /// The view the confirm box was opened over.
+    pub fn confirm_back(&self) -> Mode {
+        self.confirm.as_ref().map_or(Mode::Normal, |c| c.back)
+    }
+
+    fn accept_confirm(&mut self) {
+        if self
+            .confirm
+            .as_ref()
+            .is_some_and(|c| c.opened.elapsed() < CONFIRM_ARM)
+        {
             return;
         }
-        let job = AsyncJob::DiscardHunk {
-            path,
-            hunk_index: self.hunk,
-            staged,
+        let Some(confirm) = self.confirm.take() else {
+            self.mode = Mode::Normal;
+            return;
         };
-        if let Err(e) = self.queue.submit(job) {
-            self.error = Some(e.to_string());
+        self.mode = confirm.back;
+        self.run_danger(confirm.action);
+    }
+
+    fn cancel_confirm(&mut self) {
+        self.mode = self.confirm.take().map_or(Mode::Normal, |c| c.back);
+    }
+
+    fn run_danger(&mut self, action: DangerAction) {
+        let jobs: Vec<AsyncJob> = match action {
+            DangerAction::DiscardFiles(paths) => paths
+                .into_iter()
+                .map(|path| AsyncJob::DiscardFile { path })
+                .collect(),
+            DangerAction::RestoreHunk {
+                path,
+                hunk_index,
+                staged,
+            } => vec![AsyncJob::DiscardHunk {
+                path,
+                hunk_index,
+                staged,
+            }],
+            DangerAction::DeleteBranch(name) => vec![AsyncJob::DeleteBranch { name }],
+            DangerAction::DropStash(index) => vec![AsyncJob::StashDrop { index }],
+        };
+        for job in jobs {
+            if let Err(e) = self.submit_job(job) {
+                self.error = Some(e.to_string());
+                return;
+            }
         }
     }
 
@@ -3576,12 +4024,25 @@ impl App {
         let job = AsyncJob::Commit {
             message: self.draft.clone(),
         };
-        match self.queue.submit(job) {
+        match self.submit_job(job) {
             Ok(()) => {
                 self.mode = Mode::Normal;
-                self.draft.clear();
+                // Kept until the commit is known to have succeeded.
+                self.commit_stash = std::mem::take(&mut self.draft);
+                self.draft_cursor = 0;
             }
             Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// `c`: open the commit box. A message left there earlier (Esc, or a
+    /// commit that failed) is still in it.
+    fn open_commit_box(&mut self) {
+        self.mode = Mode::Committing;
+        self.draft = self.commit_stash.clone();
+        self.move_draft_end();
+        if !self.draft.is_empty() {
+            self.notice = Some("your earlier message is back in the box".into());
         }
     }
 
@@ -3616,7 +4077,7 @@ impl App {
             path,
             hunk_index: self.hunk,
         };
-        if let Err(e) = self.queue.submit(job) {
+        if let Err(e) = self.submit_job(job) {
             self.error = Some(e.to_string());
         }
     }
@@ -3665,7 +4126,7 @@ impl App {
             } else {
                 AsyncJob::LoadDiff { path, staged }
             };
-            if let Err(e) = self.queue.submit(job) {
+            if let Err(e) = self.submit_job(job) {
                 self.error = Some(e.to_string());
             }
         }
@@ -3699,7 +4160,7 @@ impl App {
             } else {
                 AsyncJob::LoadDiff { path, staged }
             };
-            if let Err(e) = self.queue.submit(job) {
+            if let Err(e) = self.submit_job(job) {
                 self.error = Some(e.to_string());
             }
         }
@@ -3726,7 +4187,7 @@ impl App {
     /// Request the branch list unless already loaded/loading.
     fn maybe_load_branches(&mut self) {
         if self.focus == Focus::Branches && self.branches.is_none() {
-            if let Err(e) = self.queue.submit(AsyncJob::ListBranches) {
+            if let Err(e) = self.submit_job(AsyncJob::ListBranches) {
                 self.error = Some(e.to_string());
             }
         }
@@ -3736,7 +4197,7 @@ impl App {
         if self.branches.is_some() {
             // Forget the snapshot so the fresh list replaces it wholesale.
             self.branches = None;
-            if let Err(e) = self.queue.submit(AsyncJob::ListBranches) {
+            if let Err(e) = self.submit_job(AsyncJob::ListBranches) {
                 self.error = Some(e.to_string());
             }
         }
@@ -3748,7 +4209,7 @@ impl App {
     /// Request history unless already loaded/loading.
     fn maybe_load_log(&mut self) {
         if self.focus == Focus::Log && self.log.is_none() {
-            if let Err(e) = self.queue.submit(AsyncJob::ListLog {
+            if let Err(e) = self.submit_job(AsyncJob::ListLog {
                 limit: Self::LOG_LIMIT,
             }) {
                 self.error = Some(e.to_string());
@@ -3759,7 +4220,7 @@ impl App {
     fn reload_log(&mut self) {
         if self.log.is_some() {
             self.log = None;
-            if let Err(e) = self.queue.submit(AsyncJob::ListLog {
+            if let Err(e) = self.submit_job(AsyncJob::ListLog {
                 limit: Self::LOG_LIMIT,
             }) {
                 self.error = Some(e.to_string());
@@ -3774,7 +4235,7 @@ impl App {
         let job = AsyncJob::CreateBranch {
             name: self.draft.clone(),
         };
-        match self.queue.submit(job) {
+        match self.submit_job(job) {
             Ok(()) => {
                 self.mode = Mode::Normal;
                 self.draft.clear();
@@ -3787,22 +4248,7 @@ impl App {
         let Some(branch) = self.selected_branch() else {
             return;
         };
-        if let Err(e) = self
-            .queue
-            .submit(AsyncJob::CheckoutBranch { name: branch.name })
-        {
-            self.error = Some(e.to_string());
-        }
-    }
-
-    fn delete_selected_branch(&mut self) {
-        let Some(branch) = self.selected_branch() else {
-            return;
-        };
-        if let Err(e) = self
-            .queue
-            .submit(AsyncJob::DeleteBranch { name: branch.name })
-        {
+        if let Err(e) = self.submit_job(AsyncJob::CheckoutBranch { name: branch.name }) {
             self.error = Some(e.to_string());
         }
     }
@@ -3824,7 +4270,7 @@ impl App {
     /// Request the stash list unless already loaded/loading.
     fn maybe_load_stash(&mut self) {
         if self.focus == Focus::Stash && self.stash.is_none() {
-            if let Err(e) = self.queue.submit(AsyncJob::ListStash) {
+            if let Err(e) = self.submit_job(AsyncJob::ListStash) {
                 self.error = Some(e.to_string());
             }
         }
@@ -3833,7 +4279,7 @@ impl App {
     fn reload_stash(&mut self) {
         if self.stash.is_some() {
             self.stash = None;
-            if let Err(e) = self.queue.submit(AsyncJob::ListStash) {
+            if let Err(e) = self.submit_job(AsyncJob::ListStash) {
                 self.error = Some(e.to_string());
             }
         }
@@ -3884,7 +4330,7 @@ impl App {
         let job = AsyncJob::StashPush {
             message: self.draft.clone(),
         };
-        match self.queue.submit(job) {
+        match self.submit_job(job) {
             Ok(()) => {
                 self.mode = Mode::Normal;
                 self.draft.clear();
@@ -3897,19 +4343,7 @@ impl App {
         let Some(entry) = self.selected_stash() else {
             return;
         };
-        if let Err(e) = self.queue.submit(AsyncJob::StashPop { index: entry.index }) {
-            self.error = Some(e.to_string());
-        }
-    }
-
-    fn drop_selected_stash(&mut self) {
-        let Some(entry) = self.selected_stash() else {
-            return;
-        };
-        if let Err(e) = self
-            .queue
-            .submit(AsyncJob::StashDrop { index: entry.index })
-        {
+        if let Err(e) = self.submit_job(AsyncJob::StashPop { index: entry.index }) {
             self.error = Some(e.to_string());
         }
     }
@@ -3919,7 +4353,7 @@ impl App {
     /// the status panel shows "pulling…" until it lands or fails.
     fn start_pull(&mut self) {
         self.syncing = Some("pulling…".into());
-        if let Err(e) = self.queue.submit(AsyncJob::Pull) {
+        if let Err(e) = self.submit_job(AsyncJob::Pull) {
             self.syncing = None;
             self.error = Some(e.to_string());
         }
@@ -3978,7 +4412,7 @@ impl App {
             self.mode = self.sync_return;
             return;
         };
-        match self.queue.submit(AsyncJob::Push {
+        match self.submit_job(AsyncJob::Push {
             remote,
             branch,
             set_upstream: false,
@@ -4008,7 +4442,7 @@ impl App {
             self.error = Some("still loading — try again in a moment".into());
             return;
         };
-        match self.queue.submit(AsyncJob::Push {
+        match self.submit_job(AsyncJob::Push {
             remote,
             branch,
             set_upstream: true,
@@ -4035,7 +4469,7 @@ impl App {
             self.error = Some("still loading — try again in a moment".into());
             return;
         };
-        match self.queue.submit(AsyncJob::Publish {
+        match self.submit_job(AsyncJob::Publish {
             remote: "origin".to_string(),
             url,
             branch,
@@ -4052,7 +4486,7 @@ impl App {
 
     /// Refresh upstream tracking state (cheap local reads, no network).
     fn reload_sync(&mut self) {
-        if let Err(e) = self.queue.submit(AsyncJob::LoadSync) {
+        if let Err(e) = self.submit_job(AsyncJob::LoadSync) {
             self.error = Some(e.to_string());
         }
     }
@@ -4063,8 +4497,9 @@ impl App {
     /// either incrementally.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
-        while let Some(result) = self.queue.try_recv() {
-            self.apply(result);
+        while let Some((id, result)) = self.queue.try_recv_tagged() {
+            let pending = self.inflight.remove(&id).unwrap_or(Pending::Other);
+            self.apply_result(result, pending);
             changed = true;
         }
         // After a mutation the [5] preview waits for the fresh status
@@ -4083,12 +4518,82 @@ impl App {
         self.queue.has_pending()
     }
 
+    /// Submit a job and remember what kind it is until its result arrives.
+    fn submit_job(&mut self, job: AsyncJob) -> Result<(), GitError> {
+        let kind = match &job {
+            AsyncJob::Commit { .. } => Pending::Commit,
+            AsyncJob::Push { .. } | AsyncJob::Pull | AsyncJob::Publish { .. } => Pending::Sync,
+            AsyncJob::GenerateCommitMessage { .. } => Pending::Generate,
+            AsyncJob::StageHunk { .. }
+            | AsyncJob::DiscardHunk { .. }
+            | AsyncJob::StageFile { .. }
+            | AsyncJob::UnstageFile { .. }
+            | AsyncJob::DiscardFile { .. }
+            | AsyncJob::CreateBranch { .. }
+            | AsyncJob::CheckoutBranch { .. }
+            | AsyncJob::DeleteBranch { .. }
+            | AsyncJob::StashPush { .. }
+            | AsyncJob::StashPop { .. }
+            | AsyncJob::StashDrop { .. } => Pending::Mutation,
+            _ => Pending::Other,
+        };
+        let id = self.queue.submit_tagged(job)?;
+        if kind != Pending::Other {
+            self.inflight.insert(id, kind);
+        }
+        Ok(())
+    }
+
+    /// A change to the repository has been queued and not yet applied.
+    fn mutation_in_flight(&self) -> bool {
+        self.inflight
+            .values()
+            .any(|kind| matches!(kind, Pending::Mutation | Pending::Commit))
+    }
+
+    /// A new action dismisses the previous error/notice; failures of the
+    /// new action arrive later via `poll` and replace them.
+    fn clear_messages(&mut self) {
+        self.error = None;
+        self.notice = None;
+        self.error_sticky = false;
+    }
+
+    /// Everything the repository shows, reloaded: after any job that
+    /// changed it, or that failed part-way and may have.
+    fn reload_after_change(&mut self) {
+        self.refresh();
+        // Defer the [5] preview (+ Markdown) until the fresh status lands:
+        // stash push/pop changes the target itself (clean <-> dirty,
+        // whole-file <-> hunks). Show loading now so stale hunks never
+        // linger.
+        self.pending_diff_reload = true;
+        self.set_diff(None);
+        self.hunk = 0;
+        self.cursor = 0;
+        self.cursor_col = 0;
+        self.diff_scroll = 0;
+        self.md_text = None;
+        self.reload_branches();
+        self.reload_log();
+        self.reload_stash();
+        self.reload_sync();
+    }
+
+    /// Feed one result in as if a job of no particular kind produced it.
+    #[cfg(test)]
     fn apply(&mut self, result: AsyncResult) {
+        self.apply_result(result, Pending::Other);
+    }
+
+    fn apply_result(&mut self, result: AsyncResult, pending: Pending) {
         match result {
             AsyncResult::Status(st) => {
                 self.status = Some(st);
                 self.rebuild_file_list();
-                self.error = None;
+                if !self.error_sticky {
+                    self.error = None;
+                }
                 if self.pending_diff_reload {
                     self.pending_diff_reload = false;
                     self.force_reload_diff_for_fresh_status();
@@ -4109,7 +4614,7 @@ impl App {
                         self.diff_scroll = 0;
                         self.diff_whole_file = true;
                         let job = AsyncJob::LoadFile { path: d.path };
-                        if let Err(e) = self.queue.submit(job) {
+                        if let Err(e) = self.submit_job(job) {
                             self.error = Some(e.to_string());
                         }
                     } else {
@@ -4172,48 +4677,67 @@ impl App {
             }
             AsyncResult::GeneratedMessage(msg) => {
                 self.generating = false;
+                let started_from = self.gen_draft.take();
                 // The user may have Esc'd while the network call was in
-                // flight: only fill the open commit box.
-                if self.mode == Mode::Committing {
+                // flight, or kept typing: only replace the text that was
+                // there when they asked.
+                if self.mode == Mode::Committing && started_from.as_deref() == Some(&self.draft) {
                     self.draft = msg;
                     self.move_draft_end();
                     self.error = None;
+                } else if self.mode == Mode::Committing {
+                    self.notice =
+                        Some("generated message dropped: you edited the box meanwhile".into());
+                } else if self.commit_stash.trim().is_empty() {
+                    // Closed meanwhile with nothing typed: keep the result
+                    // for the next time the box opens.
+                    self.commit_stash = msg;
                 }
             }
             AsyncResult::MutationDone => {
-                self.syncing = None;
-                self.refresh();
-                // Defer the [5] preview (+ Markdown) until the fresh
-                // status lands: stash push/pop changes the target itself
-                // (clean <-> dirty, whole-file <-> hunks). Show loading
-                // now so stale hunks never linger.
-                self.pending_diff_reload = true;
-                self.set_diff(None);
-                self.hunk = 0;
-                self.cursor = 0;
-                self.cursor_col = 0;
-                self.diff_scroll = 0;
-                self.md_text = None;
-                self.reload_branches();
-                self.reload_log();
-                self.reload_stash();
-                self.reload_sync();
+                match pending {
+                    Pending::Sync => self.syncing = None,
+                    // The message is in the history now.
+                    Pending::Commit => self.commit_stash.clear(),
+                    _ => {}
+                }
+                self.reload_after_change();
             }
+            AsyncResult::Superseded => {}
             AsyncResult::Error(e) => {
-                self.syncing = None;
-                self.generating = false;
-                // A failed mutation leaves status unchanged: drop the
-                // deferred reload so the preview recovers via the normal
-                // `maybe_load_diff` path on the next poll.
-                self.pending_diff_reload = false;
                 // EmptyCommit on its own doesn't say how to fix it.
-                self.error = Some(match e {
+                let message = match e {
                     GitError::EmptyCommit => {
                         "nothing to commit: press space on a file to stage it, then c to commit"
-                            .into()
+                            .to_string()
                     }
                     _ => e.to_string(),
-                });
+                };
+                match pending {
+                    Pending::Generate => {
+                        self.generating = false;
+                        self.gen_draft = None;
+                    }
+                    Pending::Sync => {
+                        self.syncing = None;
+                        // A pull that stopped on conflicts changed plenty.
+                        self.reload_after_change();
+                    }
+                    Pending::Commit => {
+                        // Give the message back instead of losing it.
+                        if self.mode == Mode::Normal && !self.commit_stash.is_empty() {
+                            self.open_commit_box();
+                        }
+                        self.reload_after_change();
+                    }
+                    Pending::Mutation => self.reload_after_change(),
+                    // A failed load leaves status unchanged: drop any
+                    // deferred reload so the preview recovers via the
+                    // normal `maybe_load_diff` path on the next poll.
+                    Pending::Other => self.pending_diff_reload = false,
+                }
+                self.error = Some(message);
+                self.error_sticky = true;
             }
         }
     }
@@ -4706,6 +5230,7 @@ mod tests {
     fn d_on_unstaged_discards_the_file() {
         let mut fx = harness(&["a.txt"]);
         fx.app.on_key(KeyCode::Char('d'));
+        fx.app.on_key(KeyCode::Enter);
         let st = wait_for(&mut fx.app, |st| st.files.iter().all(|e| e.path != "a.txt"));
         assert!(
             st.files.iter().all(|e| e.path != "a.txt"),
@@ -4724,6 +5249,7 @@ mod tests {
                 .any(|e| e.path == "a.txt" && e.state == FileState::Staged)
         });
         fx.app.on_key(KeyCode::Char('d'));
+        fx.app.on_key(KeyCode::Enter);
         let st = wait_for(&mut fx.app, |st| st.files.iter().all(|e| e.path != "a.txt"));
         assert!(
             st.files.iter().all(|e| e.path != "a.txt"),
@@ -4752,6 +5278,7 @@ mod tests {
         // already selected.
         assert_eq!(fx.app.selected_file().unwrap().path, "new.txt");
         fx.app.on_key(KeyCode::Char('d'));
+        fx.app.on_key(KeyCode::Enter);
         wait_for(&mut fx.app, |st| {
             st.files.iter().all(|e| e.path != "new.txt")
         });
@@ -4782,6 +5309,7 @@ mod tests {
         fx.app.on_key(KeyCode::Left);
         assert_eq!(fx.app.selected_file().unwrap().path, "src/a.rs");
         fx.app.on_key(KeyCode::Char('d'));
+        fx.app.on_key(KeyCode::Enter);
         let st = wait_for(&mut fx.app, |st| {
             st.files.iter().all(|e| !e.path.starts_with("src/"))
         });
@@ -4799,6 +5327,7 @@ mod tests {
         fx.app.on_key(KeyCode::Enter);
         assert_eq!(fx.app.mode(), Mode::FullDiff);
         fx.app.on_key(KeyCode::Char('d'));
+        fx.app.on_key(KeyCode::Enter);
         wait_for(&mut fx.app, |st| st.files.iter().all(|e| e.path != "a.txt"));
     }
 
@@ -6640,6 +7169,7 @@ mod tests {
         // Select "gone" and delete it.
         select_branch(&mut fx, "gone");
         fx.app.on_key(KeyCode::Char('D'));
+        fx.app.on_key(KeyCode::Enter);
         let branches = wait_for_branches(&mut fx.app, 1);
         // Wait until "gone" disappears (list reloads after MutationDone).
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -6665,6 +7195,7 @@ mod tests {
         wait_for_branches(&mut fx.app, 1);
         // "main" is checked out; deleting it must fail loudly.
         fx.app.on_key(KeyCode::Char('D'));
+        fx.app.on_key(KeyCode::Enter);
         let err = wait_for_error(&mut fx.app);
         assert!(err.contains("checked out"), "got: {err}");
     }
@@ -6864,6 +7395,7 @@ mod tests {
         fx.app.on_key(KeyCode::Enter);
         wait_for_stash(&mut fx.app, 1);
         fx.app.on_key(KeyCode::Char('D'));
+        fx.app.on_key(KeyCode::Enter);
         wait_for_stash(&mut fx.app, 0);
     }
 
@@ -6913,12 +7445,11 @@ mod tests {
     }
 
     #[test]
-    fn shift_a_in_commit_box_starts_generation_and_no_staged_errors() {
+    fn ctrl_g_in_commit_box_starts_generation_and_no_staged_errors() {
         let mut fx = harness(&["a.txt"]);
         fx.app.on_key(KeyCode::Char('c'));
         assert_eq!(fx.app.mode(), Mode::Committing);
-        // Legacy single-KeyCode path: `A` means Shift+A.
-        fx.app.on_key(KeyCode::Char('A'));
+        fx.app.on_chord(Chord::Ctrl('g'));
         assert!(fx.app.is_generating());
         let err = wait_for_error(&mut fx.app);
         assert!(
@@ -6930,24 +7461,19 @@ mod tests {
     }
 
     #[test]
-    fn shift_a_without_shift_types_literal_a() {
+    fn capital_a_types_in_the_commit_box_with_or_without_shift() {
         let mut fx = harness(&["a.txt"]);
         fx.app.on_key(KeyCode::Char('c'));
-        // Real modifier path: no Shift means a literal `A` (caps lock).
+        // "Add ..." has to be typable: Shift+A is a letter, not a command.
+        fx.app.on_key_with_modifiers(KeyCode::Char('A'), true);
         fx.app.on_key_with_modifiers(KeyCode::Char('A'), false);
-        assert!(!fx.app.is_generating());
-        assert_eq!(fx.app.draft(), "A");
-        // Lowercase always types.
         fx.app.on_key_with_modifiers(KeyCode::Char('a'), false);
-        assert_eq!(fx.app.draft(), "Aa");
-        // Shift+A generates instead of typing.
-        fx.app.on_key_with_modifiers(KeyCode::Char('a'), true);
+        assert!(!fx.app.is_generating());
+        assert_eq!(fx.app.draft(), "AAa");
+        // Generation does not type into the draft.
+        fx.app.on_chord(Chord::Ctrl('g'));
         assert!(fx.app.is_generating());
-        assert_eq!(
-            fx.app.draft(),
-            "Aa",
-            "generation must not type into the draft"
-        );
+        assert_eq!(fx.app.draft(), "AAa");
     }
 
     #[test]
@@ -6956,6 +7482,7 @@ mod tests {
         fx.app.on_key(KeyCode::Char('c'));
         assert_eq!(fx.app.mode(), Mode::Committing);
         fx.app.generating = true;
+        fx.app.gen_draft = Some(String::new());
         fx.app
             .apply(git_tui_core::jobqueue::AsyncResult::GeneratedMessage(
                 "feat: add thing".into(),
@@ -6980,6 +7507,24 @@ mod tests {
             ));
         assert!(!fx.app.is_generating());
         assert_eq!(fx.app.draft(), "", "closed box must not be filled");
+        // It is not thrown away either: it waits in the box.
+        fx.app.on_key(KeyCode::Char('c'));
+        assert_eq!(fx.app.draft(), "feat: late");
+    }
+
+    #[test]
+    fn generated_message_does_not_overwrite_text_typed_meanwhile() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.generating = true;
+        fx.app.gen_draft = Some(String::new());
+        fx.app.on_key(KeyCode::Char('x'));
+        fx.app
+            .apply(git_tui_core::jobqueue::AsyncResult::GeneratedMessage(
+                "feat: generated".into(),
+            ));
+        assert_eq!(fx.app.draft(), "x");
+        assert!(fx.app.notice().unwrap_or("").contains("dropped"));
     }
 
     #[test]
@@ -7315,29 +7860,23 @@ mod tests {
     }
 
     #[test]
-    fn action_menu_destructive_entry_needs_a_second_enter() {
+    fn action_menu_destructive_entry_goes_through_the_confirm_box() {
         let mut fx = harness(&["a.txt"]);
         fx.app.on_key(KeyCode::Char('?'));
         type_into_menu(&mut fx.app, "discard");
         assert_eq!(fx.app.menu_matches()[0].label, "Discard changes");
         fx.app.on_key(KeyCode::Enter);
-        // Armed, not run: still open, naming the file it would discard.
-        assert_eq!(fx.app.mode(), Mode::ActionMenu);
-        let (entry, target) = fx.app.menu_confirming().unwrap();
-        assert!(entry.destructive);
-        assert_eq!(target, "a.txt");
-        // Any other key backs out of the confirmation only.
+        // Not run: the confirm box names the file it would discard.
+        assert_eq!(fx.app.mode(), Mode::Confirm);
+        assert_eq!(
+            fx.app.confirm_prompt(),
+            Some("Discard all changes to a.txt?")
+        );
         fx.app.on_key(KeyCode::Esc);
-        assert_eq!(fx.app.mode(), Mode::ActionMenu);
-        assert!(fx.app.menu_confirming().is_none());
+        assert_eq!(fx.app.mode(), Mode::Normal);
         fx.app.poll();
         let status = fx.app.status().unwrap();
         assert!(status.files.iter().any(|e| e.path == "a.txt"));
-        // Enter twice discards for real.
-        fx.app.on_key(KeyCode::Enter);
-        fx.app.on_key(KeyCode::Enter);
-        assert_eq!(fx.app.mode(), Mode::Normal);
-        wait_for(&mut fx.app, |st| st.files.is_empty());
     }
 
     #[test]
@@ -7384,5 +7923,289 @@ mod tests {
         assert_eq!(fx.app.menu_selected(), commit);
         fx.app.on_mouse_down(20, 9);
         assert_eq!(fx.app.mode(), Mode::Committing);
+    }
+
+    // ---- safety: confirmations, modifiers, paste, commit box ----
+
+    #[test]
+    fn d_asks_first_and_esc_keeps_the_file() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('d'));
+        assert_eq!(fx.app.mode(), Mode::Confirm);
+        assert_eq!(
+            fx.app.confirm_prompt(),
+            Some("Discard all changes to a.txt?")
+        );
+        // Keys that act elsewhere are inert in the box.
+        fx.app.on_key(KeyCode::Char('d'));
+        fx.app.on_key(KeyCode::Char(' '));
+        assert_eq!(fx.app.mode(), Mode::Confirm);
+        fx.app.on_key(KeyCode::Char('n'));
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        fx.app.poll();
+        let status = fx.app.status().unwrap();
+        assert!(status.files.iter().any(|e| e.path == "a.txt"));
+        // `y` confirms as well as Enter.
+        fx.app.on_key(KeyCode::Char('d'));
+        fx.app.on_key(KeyCode::Char('y'));
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        wait_for(&mut fx.app, |st| st.files.is_empty());
+    }
+
+    #[test]
+    fn confirm_names_the_folder_when_a_collapsed_folder_is_selected() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "src/a.rs", "a\n", "init");
+        commit_file(&repo, "src/b.rs", "b\n", "init");
+        let root = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(root.join("src/a.rs"), "a2\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "b2\n").unwrap();
+        drop(repo);
+        let mut fx = Fixture {
+            _dir: dir,
+            app: App::new(JobQueue::spawn(root).unwrap()),
+        };
+        wait_for(&mut fx.app, |st| st.files.len() == 2);
+        // Collapse `src/`: the selection is a file hidden inside it.
+        fx.app.on_key(KeyCode::Left);
+        fx.app.on_key(KeyCode::Char('d'));
+        let prompt = fx.app.confirm_prompt().unwrap().to_string();
+        assert!(
+            prompt.contains("2 files under src/"),
+            "the box must name the folder, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn untracked_file_prompt_says_delete() {
+        let mut fx = harness(&["a.txt"]);
+        let root = fx._dir.path().to_path_buf();
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+        fx.app.on_key(KeyCode::Char('r'));
+        wait_for(&mut fx.app, |st| {
+            st.files.iter().any(|e| e.path == "new.txt")
+        });
+        while fx.app.selected_file().map(|f| f.path.as_str()) != Some("new.txt") {
+            fx.app.on_key(KeyCode::Char('j'));
+        }
+        fx.app.on_key(KeyCode::Char('d'));
+        assert_eq!(
+            fx.app.confirm_prompt(),
+            Some("Delete untracked file new.txt?")
+        );
+    }
+
+    #[test]
+    fn confirm_can_be_switched_off_in_config() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "base\n", "init");
+        let root = repo.workdir().unwrap().to_path_buf();
+        std::fs::write(root.join("a.txt"), "dirty\n").unwrap();
+        drop(repo);
+        let mut config = Config::default();
+        config.ui.confirm_destructive = false;
+        let mut fx = Fixture {
+            _dir: dir,
+            app: App::new_with_config(JobQueue::spawn(root).unwrap(), config),
+        };
+        wait_for(&mut fx.app, |st| st.files.iter().any(|e| e.path == "a.txt"));
+        fx.app.on_key(KeyCode::Char('d'));
+        assert_eq!(fx.app.mode(), Mode::Normal, "no box when switched off");
+        // A second press before the first lands must not hit the next row.
+        fx.app.on_key(KeyCode::Char('d'));
+        assert!(fx
+            .app
+            .notice()
+            .unwrap_or("")
+            .contains("still being applied"));
+        wait_for(&mut fx.app, |st| st.files.is_empty());
+    }
+
+    #[test]
+    fn chords_never_run_the_bare_key() {
+        let mut fx = harness(&["a.txt"]);
+        // Ctrl+D pages; it must not discard. Ctrl+X, Ctrl+Q do nothing.
+        for chord in [
+            Chord::Ctrl('d'),
+            Chord::Ctrl('x'),
+            Chord::Ctrl('q'),
+            Chord::Alt('d'),
+        ] {
+            fx.app.on_chord(chord);
+            assert_eq!(fx.app.mode(), Mode::Normal, "{chord:?}");
+            assert!(!fx.app.should_quit());
+        }
+        fx.app.poll();
+        let status = fx.app.status().unwrap();
+        assert!(status.files.iter().any(|e| e.path == "a.txt"));
+    }
+
+    #[test]
+    fn readline_keys_edit_the_commit_box() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.on_paste("fix parser bug");
+        fx.app.on_chord(Chord::Ctrl('w'));
+        assert_eq!(fx.app.draft(), "fix parser ");
+        fx.app.on_chord(Chord::WordLeft);
+        assert_eq!(fx.app.draft_cursor(), 4);
+        fx.app.on_chord(Chord::Ctrl('k'));
+        assert_eq!(fx.app.draft(), "fix ");
+        fx.app.on_chord(Chord::Ctrl('a'));
+        assert_eq!(fx.app.draft_cursor(), 0);
+        fx.app.on_chord(Chord::Ctrl('e'));
+        fx.app.on_chord(Chord::Newline);
+        fx.app.on_paste("body");
+        assert_eq!(fx.app.draft(), "fix \nbody");
+        // Ctrl+U clears the current line only.
+        fx.app.on_chord(Chord::Ctrl('u'));
+        assert_eq!(fx.app.draft(), "fix \n");
+        assert_eq!(fx.app.mode(), Mode::Committing);
+    }
+
+    #[test]
+    fn pasting_a_multi_line_message_fills_the_box_without_committing() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.on_paste("fix: thing\r\n\r\ndiscard q P body\n");
+        assert_eq!(fx.app.mode(), Mode::Committing, "a paste never submits");
+        assert_eq!(fx.app.draft(), "fix: thing\n\ndiscard q P body");
+    }
+
+    #[test]
+    fn pasting_outside_a_text_box_does_nothing() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_paste("dQq p\n");
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert!(!fx.app.should_quit());
+        assert!(fx.app.notice().unwrap_or("").contains("paste ignored"));
+        fx.app.poll();
+        assert!(fx
+            .app
+            .status()
+            .unwrap()
+            .files
+            .iter()
+            .any(|e| e.path == "a.txt"));
+    }
+
+    #[test]
+    fn pasting_into_a_one_line_box_stays_on_one_line() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('2'));
+        fx.app.on_key(KeyCode::Char('a'));
+        assert_eq!(fx.app.mode(), Mode::NewBranch);
+        fx.app.on_paste("feat/x\nrm -rf\n");
+        assert_eq!(fx.app.mode(), Mode::NewBranch);
+        assert_eq!(fx.app.draft(), "feat/x rm -rf");
+    }
+
+    #[test]
+    fn esc_keeps_the_commit_message_for_next_time() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.on_paste("wip: half a thought");
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(fx.app.draft(), "");
+        // Another prompt in between does not disturb it.
+        fx.app.on_key(KeyCode::Char('/'));
+        fx.app.on_key(KeyCode::Esc);
+        fx.app.on_key(KeyCode::Char('c'));
+        assert_eq!(fx.app.draft(), "wip: half a thought");
+        assert_eq!(fx.app.draft_cursor(), fx.app.draft().chars().count());
+    }
+
+    #[test]
+    fn failed_commit_gives_the_message_back() {
+        let mut fx = harness(&["a.txt"]);
+        // Nothing staged: the commit is refused by the worker.
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.on_paste("feat: my carefully written message");
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        let err = wait_for_error(&mut fx.app);
+        assert!(err.contains("nothing to commit"), "got: {err}");
+        assert_eq!(fx.app.mode(), Mode::Committing, "box reopens");
+        assert_eq!(fx.app.draft(), "feat: my carefully written message");
+    }
+
+    #[test]
+    fn successful_commit_clears_the_kept_message() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char(' '));
+        wait_for(&mut fx.app, |st| {
+            st.files.iter().any(|e| e.state == FileState::Staged)
+        });
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.on_paste("feat: done");
+        fx.app.on_key(KeyCode::Enter);
+        wait_for(&mut fx.app, |st| st.files.is_empty());
+        fx.app.on_key(KeyCode::Char('c'));
+        assert_eq!(fx.app.draft(), "", "nothing left over after success");
+    }
+
+    #[test]
+    fn error_from_a_failed_job_survives_the_refresh_that_follows() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('c'));
+        fx.app.on_paste("x");
+        fx.app.on_key(KeyCode::Enter);
+        wait_for_error(&mut fx.app);
+        // The failure triggers a status reload; let it land.
+        for _ in 0..50 {
+            fx.app.poll();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(fx.app.error().is_some(), "error wiped by the refresh");
+        // The next key press dismisses it.
+        fx.app.on_key(KeyCode::Esc);
+        assert!(fx.app.error().is_none());
+    }
+
+    #[test]
+    fn q_in_the_fullscreen_diff_closes_the_diff_only() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FullDiff);
+        fx.app.on_key(KeyCode::Char('q'));
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert!(!fx.app.should_quit());
+    }
+
+    #[test]
+    fn popup_buttons_and_click_outside_work_like_their_keys() {
+        let mut fx = harness(&["a.txt"]);
+        fx.app.on_key(KeyCode::Char('d'));
+        assert_eq!(fx.app.mode(), Mode::Confirm);
+        let popup = Rect::new(10, 5, 40, 6);
+        fx.app.set_modal_rect(popup);
+        fx.app
+            .add_click(Rect::new(12, 10, 5, 1), UiClick::Key(KeyCode::Enter));
+        fx.app
+            .add_click(Rect::new(18, 10, 4, 1), UiClick::Key(KeyCode::Esc));
+        // [No]
+        fx.app.on_mouse_down(19, 10);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        // Click outside the box cancels too.
+        fx.app.on_key(KeyCode::Char('d'));
+        fx.app.set_modal_rect(popup);
+        fx.app.on_mouse_down(0, 0);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        fx.app.poll();
+        assert!(fx
+            .app
+            .status()
+            .unwrap()
+            .files
+            .iter()
+            .any(|e| e.path == "a.txt"));
+        // [Yes]
+        fx.app.on_key(KeyCode::Char('d'));
+        fx.app.set_modal_rect(popup);
+        fx.app
+            .add_click(Rect::new(12, 10, 5, 1), UiClick::Key(KeyCode::Enter));
+        fx.app.on_mouse_down(13, 10);
+        wait_for(&mut fx.app, |st| st.files.is_empty());
     }
 }

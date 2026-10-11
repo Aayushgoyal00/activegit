@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod fuzzy;
+mod input;
 mod markdown;
 mod menu;
 mod session;
@@ -12,15 +13,17 @@ mod workspace;
 
 use anyhow::{Context, Result};
 use config::{Config, Theme};
+use crossterm::event::KeyCode;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use git_tui_core::repo::Repo;
+use input::Input;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use session::Session;
@@ -76,8 +79,15 @@ fn main() -> Result<()> {
     // scratch buffer; on `LeaveAlternateScreen` the shell contents reappear.
     // All drawing from here on is just ANSI escape sequences (cursor moves,
     // colors) emitted by ratatui — you never write them by hand.
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)
-        .context("cannot enter alternate screen")?;
+    execute!(out, EnterAlternateScreen).context("cannot enter alternate screen")?;
+    // `[ui] mouse = false` leaves the mouse to the terminal (native text
+    // selection); everything stays reachable from the keyboard.
+    if workspace.mouse_enabled() {
+        let _ = execute!(out, EnableMouseCapture);
+    }
+    // Best effort: older Windows consoles support neither. Pastes then
+    // arrive as key presses and are caught by `input::paste_text`.
+    let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend).context("cannot create terminal")?;
 
@@ -127,7 +137,13 @@ fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            stdout(),
+            DisableBracketedPaste,
+            DisableFocusChange,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         original(info);
     }));
 }
@@ -136,8 +152,10 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableBracketedPaste,
+        DisableFocusChange,
+        DisableMouseCapture,
+        LeaveAlternateScreen
     );
     let _ = terminal.show_cursor();
 }
@@ -155,21 +173,6 @@ fn map_mouse(kind: MouseEventKind, col: u16, row: u16) -> Option<workspace::Mous
         MouseEventKind::ScrollDown => Some(MouseAction::ScrollDown(col, row)),
         _ => None,
     }
-}
-
-/// Some terminals report Shift+letter as lowercase + SHIFT instead of the
-/// uppercase char, which would misclassify Shift+q (`Q`, quit-all) as `q`
-/// (close-project). Normalize `a`-`z` + SHIFT to `A`-`Z` so `KeyCode`-only
-/// bindings stay reliable regardless of the terminal.
-fn normalize_key(code: KeyCode, modifiers: KeyModifiers) -> KeyCode {
-    if modifiers.contains(KeyModifiers::SHIFT) {
-        if let KeyCode::Char(c) = code {
-            if c.is_ascii_lowercase() {
-                return KeyCode::Char(c.to_ascii_uppercase());
-            }
-        }
-    }
-    code
 }
 
 struct Cli {
@@ -253,6 +256,7 @@ fn run(
 ) -> Result<()> {
     let mut welcome_was_visible = workspace.welcome_visible();
     let mut last_draw: Option<Instant> = None;
+    let mut last_paste: Option<Instant> = None;
     loop {
         let tick = if workspace.busy() {
             BUSY_TICK
@@ -263,12 +267,14 @@ fn run(
         if event::poll(tick).context("cannot poll input")? {
             // Drain everything already queued before drawing: a held key
             // then costs one frame per batch, not one frame per repeat.
+            let mut batch = Vec::new();
             loop {
-                redraw |= handle_event(event::read().context("cannot read input")?, workspace);
+                batch.push(event::read().context("cannot read input")?);
                 if !event::poll(Duration::ZERO).context("cannot poll input")? {
                     break;
                 }
             }
+            redraw |= handle_batch(batch, workspace, &mut last_paste);
         }
         redraw |= workspace.poll();
         // Persist the welcome dismissal so the intro shows exactly once.
@@ -290,37 +296,83 @@ fn run(
     }
 }
 
+/// A paste that arrives as key presses can span several reads; keys that
+/// follow a detected burst this closely are still part of it.
+const PASTE_TAIL: Duration = Duration::from_millis(120);
+
+/// Apply everything read in one go; returns whether the screen needs a
+/// repaint. A burst of plain keys is a paste (see [`input::paste_text`]) and
+/// goes to the focused text box as text instead of being run key by key.
+fn handle_batch(
+    batch: Vec<Event>,
+    workspace: &mut Workspace,
+    last_paste: &mut Option<Instant>,
+) -> bool {
+    let inputs: Vec<Input> = batch
+        .iter()
+        .filter_map(|event| match event {
+            Event::Key(key) => Some(input::classify(key)),
+            _ => None,
+        })
+        .collect();
+    let in_tail = last_paste.is_some_and(|t| t.elapsed() < PASTE_TAIL);
+    let pasted = match input::paste_text(&inputs) {
+        Some(text) => Some(text),
+        // The tail of a paste: whatever plain keys it holds are text too.
+        None if in_tail => {
+            let text: String = inputs
+                .iter()
+                .filter_map(|input| match input {
+                    Input::Key(KeyCode::Char(c), _) => Some(*c),
+                    Input::Key(KeyCode::Enter, _) => Some('\n'),
+                    _ => None,
+                })
+                .collect();
+            (!text.is_empty()).then_some(text)
+        }
+        None => None,
+    };
+    let mut redraw = false;
+    if let Some(text) = &pasted {
+        *last_paste = Some(Instant::now());
+        workspace.on_paste(text);
+        redraw = true;
+    }
+    for event in batch {
+        match event {
+            // Already delivered as pasted text above.
+            Event::Key(_) if pasted.is_some() => {}
+            event => redraw |= handle_event(event, workspace),
+        }
+    }
+    redraw
+}
+
 /// Apply one terminal event; returns whether the screen needs a repaint.
 /// Key releases (Windows reports one per keystroke) are ignored without
 /// stalling the loop.
 fn handle_event(event: Event, workspace: &mut Workspace) -> bool {
-    let key = match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => key,
-        Event::Key(_) => return false,
+    match event {
+        Event::Key(key) => match input::classify(&key) {
+            Input::Key(code, shift) => workspace.on_key_with_modifiers(code, shift),
+            Input::Chord(chord) => workspace.on_chord(chord),
+            // Ctrl-C safety hatch: works even if the user rebinds `quit`
+            // away from `Q`, and in text modals where `q` is literal.
+            Input::Quit => workspace.request_quit(),
+            Input::Ignored => return false,
+        },
         Event::Mouse(m) => {
             // Plain pointer motion maps to nothing and needs no repaint.
-            return match map_mouse(m.kind, m.column, m.row) {
-                Some(action) => {
-                    workspace.on_mouse(action);
-                    true
-                }
-                None => false,
-            };
+            match map_mouse(m.kind, m.column, m.row) {
+                Some(action) => workspace.on_mouse(action),
+                None => return false,
+            }
         }
-        _ => return true,
-    };
-    // Ctrl-C safety hatch: works even if the user rebinds `quit`
-    // away from `q`, and in text modals where `q` is literal.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
-    {
-        workspace.request_quit();
-    } else {
-        let code = normalize_key(key.code, key.modifiers);
-        // `normalize_key` folds Shift+a into `A`; the commit box needs the
-        // original Shift state so a literal `A` (caps lock) still types
-        // normally.
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        workspace.on_key_with_modifiers(code, shift || matches!(code, KeyCode::Char('A')));
+        Event::Paste(text) => workspace.on_paste(&text),
+        // Coming back to the terminal: files may have changed meanwhile.
+        Event::FocusGained => workspace.on_focus_gained(),
+        Event::FocusLost => return false,
+        Event::Resize(..) => {}
     }
     true
 }
@@ -465,23 +517,6 @@ mod tests {
             None
         );
         assert_eq!(map_mouse(MouseEventKind::Moved, 3, 4), None);
-    }
-
-    #[test]
-    fn shift_lowercase_normalizes_to_uppercase() {
-        use crossterm::event::KeyModifiers;
-        assert_eq!(
-            normalize_key(KeyCode::Char('q'), KeyModifiers::SHIFT),
-            KeyCode::Char('Q')
-        );
-        assert_eq!(
-            normalize_key(KeyCode::Char('q'), KeyModifiers::empty()),
-            KeyCode::Char('q')
-        );
-        assert_eq!(
-            normalize_key(KeyCode::Char('Q'), KeyModifiers::SHIFT),
-            KeyCode::Char('Q')
-        );
     }
 
     fn init_repo(dir: &tempfile::TempDir) {

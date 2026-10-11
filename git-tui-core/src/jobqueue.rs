@@ -13,8 +13,9 @@ use crate::stash::StashEntry;
 use crate::status::RepoStatus;
 use crate::sync::SyncStatus;
 use crossbeam_channel::{Receiver, Sender};
+use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Work requests. All data owned so it can cross threads.
@@ -151,7 +152,47 @@ pub enum AsyncResult {
         error: String,
     },
     MutationDone,
+    /// The job was skipped because a newer job of the same kind was already
+    /// queued behind it (only the newest diff / status / list matters).
+    Superseded,
     Error(GitError),
+}
+
+/// Identifies one submitted job; its result carries the same id, so the
+/// caller can tell which job an [`AsyncResult::Error`] belongs to.
+pub type JobId = u64;
+
+impl AsyncJob {
+    /// Jobs whose result replaces the previous one of the same kind. When a
+    /// newer job for the same slot is already queued, the older one is
+    /// answered with [`AsyncResult::Superseded`] instead of being computed
+    /// (holding `j` over 200 files otherwise loads 200 diffs in turn).
+    fn slot(&self) -> Option<u8> {
+        match self {
+            AsyncJob::LoadDiff { .. } | AsyncJob::LoadFile { .. } => Some(0),
+            AsyncJob::LoadMarkdown { .. } => Some(1),
+            AsyncJob::LoadCommitOverview { .. } => Some(2),
+            AsyncJob::RefreshStatus => Some(3),
+            AsyncJob::ListBranches => Some(4),
+            AsyncJob::ListLog { .. } => Some(5),
+            AsyncJob::ListStash => Some(6),
+            AsyncJob::LoadSync => Some(7),
+            _ => None,
+        }
+    }
+
+    /// Jobs that wait on the network. They run on their own thread so a
+    /// slow push or LLM call never holds up status, diffs or staging.
+    fn is_network(&self) -> bool {
+        matches!(
+            self,
+            AsyncJob::Push { .. }
+                | AsyncJob::Pull
+                | AsyncJob::Publish { .. }
+                | AsyncJob::GenerateCommitMessage { .. }
+                | AsyncJob::FetchModels { .. }
+        )
+    }
 }
 
 /// Single-writer job queue: a background thread owns the [`Repo`] and is the
@@ -159,10 +200,11 @@ pub enum AsyncResult {
 /// blocking — the channel is unbounded) and drains [`AsyncResult`]s without
 /// blocking the render loop via [`JobQueue::try_recv`].
 pub struct JobQueue {
-    job_tx: Sender<AsyncJob>,
-    result_rx: Receiver<AsyncResult>,
+    job_tx: Sender<(JobId, AsyncJob)>,
+    result_rx: Receiver<(JobId, AsyncResult)>,
     /// Jobs submitted whose result has not been received yet.
     pending: AtomicUsize,
+    next_id: AtomicU64,
 }
 
 impl JobQueue {
@@ -174,23 +216,31 @@ impl JobQueue {
 
     /// Move an already-opened [`Repo`] into the worker thread.
     pub fn spawn_from_repo(repo: Repo) -> Self {
-        let (job_tx, job_rx) = crossbeam_channel::unbounded::<AsyncJob>();
-        let (result_tx, result_rx) = crossbeam_channel::unbounded::<AsyncResult>();
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<(JobId, AsyncJob)>();
+        let (result_tx, result_rx) = crossbeam_channel::unbounded::<(JobId, AsyncResult)>();
         std::thread::spawn(move || worker_loop(repo, job_rx, result_tx));
         Self {
             job_tx,
             result_rx,
             pending: AtomicUsize::new(0),
+            next_id: AtomicU64::new(1),
         }
     }
 
     /// Submit a job without blocking. Errors only if the worker is gone.
     pub fn submit(&self, job: AsyncJob) -> Result<(), GitError> {
+        self.submit_tagged(job).map(|_| ())
+    }
+
+    /// Like [`Self::submit`], returning the id the job's result will carry
+    /// (see [`Self::try_recv_tagged`]).
+    pub fn submit_tagged(&self, job: AsyncJob) -> Result<JobId, GitError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.job_tx
-            .send(job)
+            .send((id, job))
             .map_err(|_| GitError::ChannelDisconnected)?;
         self.pending.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(id)
     }
 
     /// Whether any submitted job is still waiting for its result. The
@@ -207,14 +257,19 @@ impl JobQueue {
 
     /// Non-blocking drain for the render loop.
     pub fn try_recv(&self) -> Option<AsyncResult> {
-        let result = self.result_rx.try_recv().ok()?;
+        self.try_recv_tagged().map(|(_, result)| result)
+    }
+
+    /// Non-blocking drain that also says which job each result answers.
+    pub fn try_recv_tagged(&self) -> Option<(JobId, AsyncResult)> {
+        let tagged = self.result_rx.try_recv().ok()?;
         self.received();
-        Some(result)
+        Some(tagged)
     }
 
     /// Blocking receive (tests / simple drivers).
     pub fn recv(&self) -> Result<AsyncResult, GitError> {
-        let result = self
+        let (_, result) = self
             .result_rx
             .recv()
             .map_err(|_| GitError::ChannelDisconnected)?;
@@ -224,17 +279,56 @@ impl JobQueue {
 
     /// Blocking receive with timeout (tests).
     pub fn recv_timeout(&self, timeout: Duration) -> Option<AsyncResult> {
-        let result = self.result_rx.recv_timeout(timeout).ok()?;
+        let (_, result) = self.result_rx.recv_timeout(timeout).ok()?;
         self.received();
         Some(result)
     }
 }
 
-fn worker_loop(mut repo: Repo, jobs: Receiver<AsyncJob>, results: Sender<AsyncResult>) {
-    while let Ok(job) = jobs.recv() {
+fn worker_loop(
+    mut repo: Repo,
+    jobs: Receiver<(JobId, AsyncJob)>,
+    results: Sender<(JobId, AsyncResult)>,
+) {
+    // Everything already queued, so a job can see what is waiting behind it.
+    let mut backlog: VecDeque<(JobId, AsyncJob)> = VecDeque::new();
+    loop {
+        if backlog.is_empty() {
+            match jobs.recv() {
+                Ok(job) => backlog.push_back(job),
+                // TUI is gone; shut down.
+                Err(_) => break,
+            }
+        }
+        backlog.extend(jobs.try_iter());
+        let Some((id, job)) = backlog.pop_front() else {
+            continue;
+        };
+        let superseded = job
+            .slot()
+            .is_some_and(|slot| backlog.iter().any(|(_, later)| later.slot() == Some(slot)));
+        if superseded {
+            if results.send((id, AsyncResult::Superseded)).is_err() {
+                break;
+            }
+            continue;
+        }
+        if job.is_network() {
+            if let Some(workdir) = repo.workdir() {
+                // Its own repo handle: the worker keeps serving local jobs.
+                let results = results.clone();
+                std::thread::spawn(move || {
+                    let result = match Repo::open(&workdir) {
+                        Ok(mut repo) => execute(&mut repo, job),
+                        Err(e) => AsyncResult::Error(e),
+                    };
+                    let _ = results.send((id, result));
+                });
+                continue;
+            }
+        }
         let result = execute(&mut repo, job);
-        if results.send(result).is_err() {
-            // TUI is gone; shut down.
+        if results.send((id, result)).is_err() {
             break;
         }
     }
@@ -679,6 +773,7 @@ mod tests {
         drop(repo);
         let queue = JobQueue::spawn(path).unwrap();
         // Submit three jobs back-to-back; results must arrive in order.
+        // (Three different kinds: same-kind jobs may be coalesced.)
         queue.submit(AsyncJob::RefreshStatus).unwrap();
         queue
             .submit(AsyncJob::LoadDiff {
@@ -686,13 +781,110 @@ mod tests {
                 staged: false,
             })
             .unwrap();
-        queue.submit(AsyncJob::RefreshStatus).unwrap();
+        queue.submit(AsyncJob::ListBranches).unwrap();
         let first = recv_next(&queue);
         let second = recv_next(&queue);
         let third = recv_next(&queue);
         assert!(matches!(first, AsyncResult::Status(_)), "got {first:?}");
         assert!(matches!(second, AsyncResult::Diff(_)), "got {second:?}");
-        assert!(matches!(third, AsyncResult::Status(_)), "got {third:?}");
+        assert!(matches!(third, AsyncResult::Branches(_)), "got {third:?}");
+    }
+
+    #[test]
+    fn queued_loads_of_the_same_kind_collapse_to_the_newest() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::commit_file(&repo, "b.txt", "b\n", "init");
+        testutil::dirty_file(&repo, "a.txt", "more\n");
+        testutil::dirty_file(&repo, "b.txt", "more\n");
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+        // Holding `j` over a long list: only the last file matters.
+        const N: usize = 60;
+        for i in 0..N {
+            let path = if i == N - 1 { "b.txt" } else { "a.txt" };
+            queue
+                .submit(AsyncJob::LoadDiff {
+                    path: path.into(),
+                    staged: false,
+                })
+                .unwrap();
+        }
+        let results: Vec<AsyncResult> = (0..N).map(|_| recv_next(&queue)).collect();
+        assert!(!queue.has_pending(), "every job still gets one answer");
+        // The newest is always computed, never skipped.
+        match results.last().unwrap() {
+            AsyncResult::Diff(d) => assert_eq!(d.path, "b.txt"),
+            other => panic!("last result must be the newest diff, got {other:?}"),
+        }
+        for r in &results {
+            assert!(
+                matches!(r, AsyncResult::Diff(_) | AsyncResult::Superseded),
+                "got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mutation_between_two_loads_is_never_skipped() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        testutil::dirty_file(&repo, "a.txt", "more\n");
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+        queue.submit(AsyncJob::RefreshStatus).unwrap();
+        queue
+            .submit(AsyncJob::StageFile {
+                path: "a.txt".into(),
+            })
+            .unwrap();
+        queue.submit(AsyncJob::RefreshStatus).unwrap();
+        let results: Vec<AsyncResult> = (0..3).map(|_| recv_next(&queue)).collect();
+        assert!(
+            matches!(results[1], AsyncResult::MutationDone),
+            "{results:?}"
+        );
+        // The status after the mutation reflects it.
+        match &results[2] {
+            AsyncResult::Status(st) => {
+                let entry = st.files.iter().find(|e| e.path == "a.txt").unwrap();
+                assert_eq!(entry.state, FileState::Staged);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn results_carry_the_id_of_the_job_that_produced_them() {
+        let (_dir, repo) = testutil::init_repo();
+        testutil::commit_file(&repo, "a.txt", "a\n", "init");
+        let path = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        let queue = JobQueue::spawn(path).unwrap();
+        let status = queue.submit_tagged(AsyncJob::RefreshStatus).unwrap();
+        let bad = queue
+            .submit_tagged(AsyncJob::StageHunk {
+                path: "a.txt".into(),
+                hunk_index: 9,
+            })
+            .unwrap();
+        assert_ne!(status, bad);
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen.len() < 2 {
+            if let Some(tagged) = queue.try_recv_tagged() {
+                seen.push(tagged);
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let error_id = seen
+            .iter()
+            .find(|(_, r)| matches!(r, AsyncResult::Error(_)))
+            .map(|(id, _)| *id);
+        assert_eq!(error_id, Some(bad), "the error belongs to the hunk job");
     }
 
     #[test]

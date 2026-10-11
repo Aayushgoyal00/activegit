@@ -479,6 +479,29 @@ pub struct Config {
     /// back to `$OPENAI_API_KEY` / `$ANTHROPIC_API_KEY` / `$GEMINI_API_KEY`
     /// / `$OPENROUTER_API_KEY` / `$LLM_API_KEY` at generation time.
     pub llm: LlmConfig,
+    /// `[ui]` section: interaction preferences.
+    pub ui: UiConfig,
+}
+
+/// `[ui]` options. The defaults suit a first-time user; both can be turned
+/// off by someone who knows the keys and wants the old directness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiConfig {
+    /// Ask before actions that throw work away (discard, restore hunk,
+    /// delete branch, drop stash).
+    pub confirm_destructive: bool,
+    /// Capture the mouse. `false` leaves it to the terminal, which gives
+    /// back native text selection.
+    pub mouse: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            confirm_destructive: true,
+            mouse: true,
+        }
+    }
 }
 
 /// App directory name under the XDG config home.
@@ -519,6 +542,7 @@ impl Default for Config {
             keys: KeyBindings::default(),
             theme: Theme::default_theme(),
             llm: LlmConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }
@@ -616,6 +640,17 @@ impl Config {
             theme: ThemeSection,
             #[serde(default)]
             llm: LlmSection,
+            #[serde(default)]
+            ui: UiSection,
+        }
+
+        #[derive(Default, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct UiSection {
+            #[serde(default)]
+            confirm_destructive: Option<bool>,
+            #[serde(default)]
+            mouse: Option<bool>,
         }
 
         #[derive(Deserialize)]
@@ -701,6 +736,12 @@ impl Config {
         }
         if let Some(name) = file.theme.name {
             cfg.theme = Theme::by_name(&name)?;
+        }
+        if let Some(confirm) = file.ui.confirm_destructive {
+            cfg.ui.confirm_destructive = confirm;
+        }
+        if let Some(mouse) = file.ui.mouse {
+            cfg.ui.mouse = mouse;
         }
         if let Some(provider) = file.llm.provider {
             let p = provider.trim().to_lowercase();
@@ -1105,5 +1146,20 @@ mod tests {
             cfg.theme.border_focused,
             ratatui::style::Color::Rgb(122, 162, 247)
         );
+    }
+
+    #[test]
+    fn ui_section_defaults_on_and_can_be_turned_off() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[theme]\nname = \"nord\"\n").unwrap();
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert_eq!(cfg.ui, UiConfig::default());
+        assert!(cfg.ui.confirm_destructive && cfg.ui.mouse);
+        std::fs::write(&path, "[ui]\nconfirm_destructive = false\nmouse = false\n").unwrap();
+        let cfg = Config::load_from_path(&path).unwrap();
+        assert!(!cfg.ui.confirm_destructive && !cfg.ui.mouse);
+        std::fs::write(&path, "[ui]\nmouze = false\n").unwrap();
+        assert!(Config::load_from_path(&path).is_err());
     }
 }

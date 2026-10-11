@@ -27,7 +27,7 @@ pub const WELCOME_KEYS: &[(&str, &str)] = &[
     ("enter", "fullscreen side-by-side diff"),
     ("space", "stage file, folder, or hunk"),
     ("c", "commit"),
-    ("Shift+A", "AI commit message from staged diff"),
+    ("Ctrl+G", "AI commit message (in the commit box)"),
     ("p / P", "pull / push"),
     ("/", "fuzzy-find a file"),
     ("o", "open a project"),
@@ -39,7 +39,7 @@ pub const WELCOME_FEATURES: &[&str] = &[
     "Status, inline diff, stage, and commit without leaving the terminal.",
     "Fullscreen side-by-side diffs with word-level change marks.",
     "Stage whole files, folders, or single hunks; discard with d.",
-    "AI Conventional Commits from your staged diff (Shift+A).",
+    "AI Conventional Commits from your staged diff (Ctrl+G).",
     "Several repos as tabs in one window; the session is restored.",
 ];
 

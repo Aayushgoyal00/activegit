@@ -1,12 +1,14 @@
 //! Phase 4: status + diff panels (ratatui).
 
-use crate::app::{App, Focus, HitMap, Mode, VisualSel, LLM_FIELD_LABELS, LLM_PICKER_ROWS};
+use crate::app::{App, Focus, HitMap, Mode, UiClick, VisualSel, LLM_FIELD_LABELS, LLM_PICKER_ROWS};
 use crate::config::Theme;
+use crate::input::Chord;
 use crate::markdown::render_markdown;
 use crate::syntax::{highlight_line, HiToken};
 use crate::welcome::{WELCOME_FEATURES, WELCOME_KEYS};
 use crate::words::{word_diff, WordSeg};
 use crate::workspace::Workspace;
+use crossterm::event::KeyCode;
 use git_tui_core::branch::BranchInfo;
 use git_tui_core::diff::{FileDiff, LineKind};
 use git_tui_core::log::{compute_lanes, CommitInfo};
@@ -273,6 +275,7 @@ fn header_block_cursor(line: &mut Line<'static>, want: usize) {
 /// then any modal or the fullscreen diff overlay on top.
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    app.begin_frame();
     // Solid LazyVim base: paint every cell once so transparent spans
     // (gutters, padding, unfocused chrome) never show the wallpaper.
     frame.render_widget(
@@ -305,6 +308,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::LlmSettings => render_llm_modal(frame, area, app),
         Mode::ThemePicker => render_theme_modal(frame, area, app),
         Mode::ActionMenu => render_action_menu(frame, area, app),
+        Mode::Confirm => {
+            if app.confirm_back() == Mode::FullDiff {
+                render_fullscreen_diff(frame, area, app);
+            }
+            render_confirm_modal(frame, area, app);
+        }
         Mode::FindFile => {
             // Opened fullscreen: keep the diff behind the modal.
             if app.finder_return() == Mode::FullDiff {
@@ -330,6 +339,7 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
         return;
     }
     let theme = ws.theme();
+    ws.current().begin_frame();
     frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
     let bar_h = 3u16.min(area.height);
     let bar = Rect {
@@ -373,6 +383,12 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
         Mode::LlmSettings => render_llm_modal(frame, body, app),
         Mode::ThemePicker => render_theme_modal(frame, body, app),
         Mode::ActionMenu => render_action_menu(frame, body, app),
+        Mode::Confirm => {
+            if app.confirm_back() == Mode::FullDiff {
+                render_fullscreen_diff(frame, body, app);
+            }
+            render_confirm_modal(frame, body, app);
+        }
         Mode::FindFile => {
             if app.finder_return() == Mode::FullDiff {
                 render_fullscreen_diff(frame, body, app);
@@ -2238,7 +2254,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
             "generating from staged diff… · Esc cancel"
         }
         Mode::Committing => {
-            "←/→/↑/↓ move · Home/End jump · Del deletes · Shift+A generate · Enter commit · Esc cancel"
+            "Enter commit · Ctrl+G generate · Alt+Enter new line · Ctrl+W del word · Esc close (keeps text)"
         }
         Mode::NewBranch => "←/→ move · Home/End jump · Del deletes · Enter create branch · Esc cancel",
         Mode::StashPush => "←/→ move · Home/End jump · Del deletes · Enter stash · Esc cancel",
@@ -2261,6 +2277,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         Mode::LlmSettings => "tab/↑↓ switch field · ←/→ choose/edit · enter save · esc cancel",
         Mode::ThemePicker => "↑/↓ preview · enter keep + save · esc cancel",
         Mode::ActionMenu => "type to filter · ↑/↓ move · enter run · esc close",
+        Mode::Confirm => "enter / y confirm · esc / n cancel",
         Mode::OpenProject => {
             "type to filter · ↑/↓ move · enter open/descend · → descend · ← up · tab jump to path · esc clear/close"
         }
@@ -2353,7 +2370,7 @@ pub(crate) fn footer_buttons(app: &App) -> Vec<(&'static str, FooterAction)> {
             ("Theme", Theme),
             ("Menu", Menu),
         ],
-        _ => vec![("Find", Find)],
+        _ => Vec::new(),
     }
 }
 
@@ -2370,6 +2387,101 @@ pub(crate) fn footer_button_at(buttons: &[(&str, FooterAction)], x: usize) -> Op
         off += w;
     }
     None
+}
+
+/// The last `width` display cells of `text`, with a leading `…` when it had
+/// to be cut. Cuts on character boundaries (paths are not always ASCII).
+fn tail_fit(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let budget = width.saturating_sub(1);
+    let mut used = 0;
+    let mut start = text.len();
+    for (i, c) in text.char_indices().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    format!("…{}", &text[start..])
+}
+
+/// Draw `[label]` buttons on the popup's bottom border and make them
+/// clickable: each one does what its key does (see [`UiClick`]). Also
+/// records the popup's area, which is what "click outside" is measured
+/// against. Buttons that do not fit are left out.
+fn popup_buttons(frame: &mut Frame, app: &App, popup: Rect, buttons: &[(&str, UiClick)]) {
+    app.set_modal_rect(popup);
+    if popup.height < 3 {
+        return;
+    }
+    let theme = app.theme();
+    let y = popup.y + popup.height - 1;
+    let right = popup.x + popup.width.saturating_sub(2);
+    let mut x = popup.x + 2;
+    for (label, click) in buttons {
+        let text = format!("[{label}]");
+        let w = text.width() as u16;
+        if x + w > right {
+            break;
+        }
+        let rect = Rect::new(x, y, w, 1);
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                text,
+                Style::default()
+                    .fg(theme.border_focused)
+                    .bg(theme.bg)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            rect,
+        );
+        app.add_click(rect, *click);
+        x += w + 1;
+    }
+}
+
+const OK: UiClick = UiClick::Key(KeyCode::Enter);
+const CANCEL: UiClick = UiClick::Key(KeyCode::Esc);
+
+/// Yes/no box before an action that throws work away. The question names
+/// exactly what will be affected.
+fn render_confirm_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
+    let width = 64u16.min(area.width.saturating_sub(2)).max(3);
+    let inner_w = width.saturating_sub(2).max(1) as usize;
+    let prompt = app.confirm_prompt().unwrap_or_default();
+    let rows = wrap_draft(prompt, 0, inner_w).rows;
+    // Borders + question + blank + key line.
+    let popup = centered_rect(area, width, rows.len() as u16 + 4);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
+    let mut lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .map(|row| {
+            Line::styled(
+                row,
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "enter / y: yes · esc / n: no".to_string(),
+        Style::default().fg(theme.hint),
+    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.error))
+        .title(" Confirm ")
+        .style(Style::default().bg(theme.bg));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    popup_buttons(frame, app, popup, &[("Yes", OK), ("No", CANCEL)]);
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -2496,6 +2608,7 @@ fn render_finder_modal(frame: &mut Frame, area: Rect, app: &App) {
     }
     app.set_hit(HitMap::Finder, hit);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+    popup_buttons(frame, app, popup, &[("Open", OK), ("Cancel", CANCEL)]);
     // Cursor inside the (possibly scrolled) query text.
     let cursor_x = popup.x + 1 + 2 + query_cursor as u16;
     let cursor_y = popup.y + 1;
@@ -2538,6 +2651,7 @@ fn render_theme_modal(frame: &mut Frame, area: Rect, app: &App) {
     }
     app.set_hit(HitMap::ThemePicker, hit);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+    popup_buttons(frame, app, popup, &[("Keep", OK), ("Cancel", CANCEL)]);
 }
 
 /// Actions menu (`?`): filter line, then every matching action with its
@@ -2560,9 +2674,8 @@ fn render_action_menu(frame: &mut Frame, area: Rect, app: &App) {
         }
         rows.push(Row::Entry(i));
     }
-    let confirming = app.menu_confirming();
-    // Borders + filter line + rows + a line kept free for the confirm.
-    let popup = centered_rect(area, 64, rows.len() as u16 + 4);
+    // Borders + filter line + rows.
+    let popup = centered_rect(area, 64, rows.len() as u16 + 3);
     frame.render_widget(Clear, popup);
     frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
     let block = panel_block(true, theme, " Actions ".to_string());
@@ -2583,7 +2696,7 @@ fn render_action_menu(frame: &mut Frame, area: Rect, app: &App) {
     ]));
     // Window over the rows that keeps the selection (and, when it is the
     // first of its group, its heading) on screen.
-    let visible = inner_h.saturating_sub(2);
+    let visible = inner_h.saturating_sub(1);
     let selected_row = rows
         .iter()
         .position(|r| matches!(r, Row::Entry(i) if *i == selected))
@@ -2636,34 +2749,11 @@ fn render_action_menu(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
     app.set_hit(HitMap::ActionMenu, hit);
-    if let Some((entry, target)) = &confirming {
-        while lines.len() + 1 < inner_h {
-            lines.push(Line::styled(String::new(), plain));
-        }
-        let what = if target.is_empty() {
-            entry.label.to_string()
-        } else {
-            format!("{}: {target}", entry.label)
-        };
-        // Keep the target visible on narrow popups: drop the hint first.
-        let mut text = format!("{what}? enter confirms · any other key cancels");
-        if text.width() > inner_w {
-            text = format!("{what}? enter confirms");
-        }
-        lines.push(Line::styled(
-            text,
-            Style::default()
-                .fg(theme.error)
-                .bg(theme.bg)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
     frame.render_widget(Paragraph::new(lines).block(block), popup);
-    if confirming.is_none() {
-        let cursor_x = popup.x + 1 + 2 + query_cursor as u16;
-        if cursor_x < popup.x + popup.width.saturating_sub(1) {
-            frame.set_cursor_position((cursor_x, popup.y + 1));
-        }
+    popup_buttons(frame, app, popup, &[("Run", OK), ("Close", CANCEL)]);
+    let cursor_x = popup.x + 1 + 2 + query_cursor as u16;
+    if cursor_x < popup.x + popup.width.saturating_sub(1) {
+        frame.set_cursor_position((cursor_x, popup.y + 1));
     }
 }
 
@@ -2693,7 +2783,7 @@ fn render_llm_modal(frame: &mut Frame, area: Rect, app: &App) {
     let block = panel_block(
         true,
         theme,
-        " LLM setup — Shift+A uses this in the commit box ".to_string(),
+        " LLM setup — Ctrl+G uses this in the commit box ".to_string(),
     );
     let inner_w = popup.width.saturating_sub(2) as usize;
     let inner_h = popup.height.saturating_sub(2) as usize;
@@ -2758,6 +2848,7 @@ fn render_llm_modal(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(theme.hint).bg(theme.bg),
     )));
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+    popup_buttons(frame, app, popup, &[("Save", OK), ("Cancel", CANCEL)]);
     let cursor_x = popup.x + 1 + cursor_prefix as u16 + cursor_col as u16;
     let cursor_y = popup.y + 1 + cursor_row as u16;
     if cursor_x < popup.x + popup.width.saturating_sub(1) {
@@ -2916,7 +3007,7 @@ fn render_commit_modal(frame: &mut Frame, area: Rect, app: &App) {
         let placeholder = if app.is_generating() {
             "generating…"
         } else {
-            "Type a message… · Shift+A for AI"
+            "Type a message… · Ctrl+G for AI"
         };
         vec![Line::styled(
             placeholder.to_string(),
@@ -2932,6 +3023,16 @@ fn render_commit_modal(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(lines).block(panel_block(true, theme, commit_title(app).to_string())),
         popup,
+    );
+    popup_buttons(
+        frame,
+        app,
+        popup,
+        &[
+            ("Commit", OK),
+            ("Generate", UiClick::Chord(Chord::Ctrl('g'))),
+            ("Close", CANCEL),
+        ],
     );
     // Cursor tracks the true edit position (start of the box when showing
     // a placeholder), even when wrapped/scrolled.
@@ -2963,6 +3064,7 @@ fn render_input_modal(frame: &mut Frame, area: Rect, app: &App, title: &str) {
             .title(title),
     );
     frame.render_widget(input, popup);
+    popup_buttons(frame, app, popup, &[("OK", OK), ("Cancel", CANCEL)]);
     // Cursor tracks the true edit position, even when the text is scrolled.
     let cursor_x = popup.x + 1 + cursor_col as u16;
     let cursor_y = popup.y + 1;
@@ -2995,10 +3097,10 @@ fn render_open_browser_modal(
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
 
     // Current folder on top (left-truncated when too long).
-    let mut cwd = browser.cwd.display().to_string();
-    if cwd.len() > inner_w.saturating_sub(2) {
-        cwd = format!("…{}", &cwd[cwd.len().saturating_sub(inner_w - 3)..]);
-    }
+    let cwd = tail_fit(
+        &browser.cwd.display().to_string(),
+        inner_w.saturating_sub(2),
+    );
     lines.push(Line::from(vec![
         Span::styled(
             "> ",
@@ -3120,6 +3222,7 @@ fn render_open_browser_modal(
     }
     app.set_hit(HitMap::Browser, hit);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+    popup_buttons(frame, app, popup, &[("Open", OK), ("Close", CANCEL)]);
     if browser.editing_path {
         let (_, col) = input_window(
             app.draft(),
@@ -3149,10 +3252,7 @@ fn render_confirm_init_modal(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
     let block = panel_block(true, theme, " Init new repository? ".to_string());
     let inner_w = popup.width.saturating_sub(2) as usize;
-    let mut path = app.draft().to_string();
-    if path.len() > inner_w {
-        path = format!("…{}", &path[path.len().saturating_sub(inner_w - 1)..]);
-    }
+    let path = tail_fit(app.draft(), inner_w);
     let lines = vec![
         Line::raw("Not a git repository:"),
         Line::from(vec![Span::styled(
@@ -3166,6 +3266,7 @@ fn render_confirm_init_modal(frame: &mut Frame, area: Rect, app: &App) {
         )]),
     ];
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+    popup_buttons(frame, app, popup, &[("Init", OK), ("Back", CANCEL)]);
 }
 
 /// Confirm step for pushing to the tracked upstream (`P` with an
@@ -3209,6 +3310,7 @@ fn render_confirm_push_modal(frame: &mut Frame, area: Rect, app: &App) {
         popup.y.saturating_add(1).saturating_add(3),
     )));
     frame.render_widget(Paragraph::new(lines).block(block), popup);
+    app.set_modal_rect(popup);
 }
 
 /// First-run welcome overlay: what activegit is, its features, and the
@@ -3787,7 +3889,7 @@ mod tests {
         let s = wscreen(&ws, 100, 32);
         assert!(s.contains("Welcome to activegit"), "title missing:\n{s}");
         assert!(s.contains("activegit"), "product name missing:\n{s}");
-        for key in ["j / k", "enter", "space", "Shift+A", "q / Q"] {
+        for key in ["j / k", "enter", "space", "Ctrl+G", "q / Q"] {
             assert!(s.contains(key), "key {key} missing:\n{s}");
         }
         assert!(s.contains("open a project"), "dismiss hint missing:\n{s}");
@@ -5964,19 +6066,46 @@ mod tests {
     }
 
     #[test]
-    fn action_menu_confirm_line_names_the_target() {
+    fn confirm_box_names_the_target_and_has_buttons() {
         use crossterm::event::KeyCode;
         let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
-        app.on_key(KeyCode::Char('?'));
-        for c in "discard".chars() {
-            app.on_key(KeyCode::Char(c));
-        }
-        app.on_key(KeyCode::Enter);
+        app.on_key(KeyCode::Char('d'));
         let s = screen(&app, 110, 40);
+        assert!(s.contains("Confirm"), "title missing:\n{s}");
         assert!(
-            s.contains("Discard changes: a.txt? enter confirms"),
-            "confirm line missing:\n{s}"
+            s.contains("Discard all changes to a.txt?"),
+            "question missing:\n{s}"
         );
+        assert!(
+            s.contains("[Yes]") && s.contains("[No]"),
+            "buttons missing:\n{s}"
+        );
+    }
+
+    #[test]
+    fn popups_carry_clickable_buttons() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        app.on_key(KeyCode::Char('c'));
+        let s = screen(&app, 110, 40);
+        for button in ["[Commit]", "[Generate]", "[Close]"] {
+            assert!(s.contains(button), "{button} missing:\n{s}");
+        }
+        app.on_key(KeyCode::Esc);
+        app.on_key(KeyCode::Char('T'));
+        let s = screen(&app, 110, 40);
+        assert!(s.contains("[Keep]") && s.contains("[Cancel]"), "{s}");
+    }
+
+    #[test]
+    fn long_non_ascii_paths_are_cut_on_character_boundaries() {
+        // Byte slicing here used to panic mid-character.
+        let path = "C:/Users/Zoë/проекты/日本語のフォルダ/very/long/path/that/does/not/fit";
+        for width in 1..40 {
+            let cut = tail_fit(path, width);
+            assert!(cut.width() <= width.max(1), "{cut:?} wider than {width}");
+        }
+        assert_eq!(tail_fit("short", 10), "short");
     }
 
     #[test]

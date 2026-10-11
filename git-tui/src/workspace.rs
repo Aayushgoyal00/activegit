@@ -42,7 +42,18 @@ pub struct Workspace {
     /// Where to persist the open-project session. `None` disables
     /// persistence (tests); the binary sets it to `Session::default_path()`.
     session_path: Option<PathBuf>,
+    /// When Backspace last emptied the browser filter. A held Backspace
+    /// must stop there instead of carrying on up the directory tree.
+    filter_emptied: Option<std::time::Instant>,
 }
+
+/// How long after Backspace empties the browser filter the next Backspace
+/// is still "the same hold" (and so does not go up a directory).
+const FILTER_HOLD: std::time::Duration = if cfg!(test) {
+    std::time::Duration::ZERO
+} else {
+    std::time::Duration::from_millis(400)
+};
 
 impl Workspace {
     pub fn open(paths: Vec<PathBuf>, config: Config) -> Result<Self> {
@@ -63,6 +74,7 @@ impl Workspace {
             bar_y: std::cell::Cell::new(0),
             show_welcome: false,
             session_path: None,
+            filter_emptied: None,
         };
         for input in &inputs {
             let root = Repo::discover(input)
@@ -467,6 +479,7 @@ impl Workspace {
             MouseAction::ScrollUp(col, row) => self.current_mut().on_wheel(col, row, true),
             MouseAction::ScrollDown(col, row) => self.current_mut().on_wheel(col, row, false),
         }
+        self.replay_click_keys();
         self.sync_theme();
         self.run_menu_request();
     }
@@ -552,10 +565,11 @@ impl Workspace {
             return;
         }
         // `q` closes the current project, `Q` (Shift+q) quits the whole app.
-        // Only in Normal/FullDiff: text modals and the finder treat `q` as
-        // literal input. `quit` wins when both actions share a key so a
+        // Only in the main view: text modals and the finder treat `q` as
+        // literal input, and in the fullscreen diff `q` closes the diff.
+        // `quit` wins when both actions share a key so a
         // `quit = ["q", "Q"]` override still quits everything.
-        if matches!(self.current().mode(), Mode::Normal | Mode::FullDiff)
+        if self.current().mode() == Mode::Normal
             && !self.keys.quit.contains(&key)
             && self.keys.project_close.contains(&key)
         {
@@ -599,6 +613,64 @@ impl Workspace {
             WorkspaceRequest::Next => self.next(),
             WorkspaceRequest::Prev => self.prev(),
             WorkspaceRequest::Close => self.close_current_project(),
+        }
+    }
+
+    /// A key pressed with Ctrl or Alt (see [`crate::input::Chord`]).
+    pub fn on_chord(&mut self, chord: crate::input::Chord) {
+        use crate::input::Chord;
+        if self.show_welcome {
+            return;
+        }
+        if matches!(self.current().mode(), Mode::OpenProject | Mode::ConfirmInit) {
+            // The browser is workspace-owned: only the list movement
+            // shortcuts mean anything there.
+            match chord {
+                Chord::Ctrl('n') => self.on_key_with_modifiers(KeyCode::Down, false),
+                Chord::Ctrl('p') => self.on_key_with_modifiers(KeyCode::Up, false),
+                _ => {}
+            }
+            return;
+        }
+        self.current_mut().on_chord(chord);
+        self.sync_theme();
+        self.run_menu_request();
+    }
+
+    /// Pasted text goes to the open text box as text, never as keys.
+    pub fn on_paste(&mut self, text: &str) {
+        if self.show_welcome {
+            return;
+        }
+        match self.current().mode() {
+            Mode::OpenProject => {
+                // Filter or path line: one line of printable characters.
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    self.on_key_browser(KeyCode::Char(c));
+                }
+            }
+            Mode::ConfirmInit => {}
+            _ => self.current_mut().on_paste(text),
+        }
+    }
+
+    /// The terminal got focus back: files, branches or the index may have
+    /// changed while the user was in their editor or another shell.
+    pub fn on_focus_gained(&mut self) {
+        if matches!(self.current().mode(), Mode::Normal | Mode::FullDiff) {
+            self.current_mut().refresh_quietly();
+        }
+    }
+
+    /// `[ui] mouse`.
+    pub fn mouse_enabled(&self) -> bool {
+        self.config.ui.mouse
+    }
+
+    /// Replay keys that clicks produced for the modes handled here.
+    fn replay_click_keys(&mut self) {
+        for key in self.current_mut().take_workspace_keys() {
+            self.on_key_with_modifiers(key, false);
         }
     }
 
@@ -649,16 +721,27 @@ impl Workspace {
                     b.push_filter_char(c);
                 }
             }
-            // Edit the query; an empty query + Backspace goes up a level.
+            // Edit the query; an empty query + Backspace goes up a level,
+            // unless this is still the hold that emptied the query.
             KeyCode::Backspace => {
                 let empty = self
                     .current()
                     .open_browser()
                     .is_some_and(|b| b.filter.is_empty());
                 if empty {
-                    self.browser_up();
+                    let same_hold = self
+                        .filter_emptied
+                        .is_some_and(|t| t.elapsed() < FILTER_HOLD);
+                    if same_hold {
+                        self.filter_emptied = Some(std::time::Instant::now());
+                    } else {
+                        self.browser_up();
+                    }
                 } else if let Some(b) = self.current_mut().open_browser_mut() {
                     b.pop_filter_char();
+                    if b.filter.is_empty() {
+                        self.filter_emptied = Some(std::time::Instant::now());
+                    }
                 }
             }
             KeyCode::Up => {
@@ -1305,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn q_in_fullscreen_closes_project_and_shift_q_quits() {
+    fn q_in_fullscreen_closes_the_diff_and_shift_q_quits() {
         let a = init_repo_with_file("a", "a.txt", "a\n");
         let b = init_repo_with_file("b", "b.txt", "b\n");
         let mut ws = Workspace::open(
@@ -1329,7 +1412,16 @@ mod tests {
         ws.on_key(KeyCode::Enter);
         assert_eq!(ws.current().mode(), Mode::FullDiff);
         ws.on_key(KeyCode::Char('q'));
-        assert_eq!(ws.len(), 1, "q fullscreen must close the project");
+        assert_eq!(
+            ws.len(),
+            2,
+            "q in the diff closes the diff, not the project"
+        );
+        assert_eq!(ws.current().mode(), Mode::Normal);
+        assert!(!ws.should_quit());
+        // From the main view it closes the project as before.
+        ws.on_key(KeyCode::Char('q'));
+        assert_eq!(ws.len(), 1);
         assert!(!ws.should_quit());
 
         // Reopen to two tabs and verify Q quits from fullscreen.
@@ -1540,5 +1632,30 @@ mod tests {
         assert_eq!(ws.apps.len(), 2);
         assert_eq!(ws.current().mode(), Mode::ActionMenu);
         assert_eq!(ws.current().draft(), "q]o");
+    }
+
+    #[test]
+    fn paste_and_chords_in_the_browser_are_text_or_nothing() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        ws.on_paste("zz\nq");
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert_eq!(ws.current().open_browser().unwrap().filter, "zzq");
+        ws.on_chord(crate::input::Chord::Ctrl('d'));
+        ws.on_chord(crate::input::Chord::Ctrl('q'));
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        assert!(!ws.should_quit());
+    }
+
+    #[test]
+    fn paste_in_the_main_view_runs_nothing() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_paste("qQo]\n");
+        assert_eq!(ws.len(), 1);
+        assert!(!ws.should_quit());
+        assert_eq!(ws.current().mode(), Mode::Normal);
     }
 }
