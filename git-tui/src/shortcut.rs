@@ -3,7 +3,9 @@
 //! taskbar instead of typed into a terminal.
 //!
 //! The shortcut starts `activegit.exe --hold --pick` in the user's home
-//! folder. `--pick` opens the start screen (recent projects, home folder,
+//! folder; through Windows Terminal's `ActiveGit` profile when Windows
+//! Terminal is installed, so the font chosen in the app applies (see
+//! [`crate::font`]). `--pick` opens the start screen (recent projects, home folder,
 //! drives) so the project is chosen first; `--hold` keeps the window open
 //! on a startup error so the message can be read.
 
@@ -23,6 +25,16 @@ const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $exe = $env:ACTIVEGIT_EXE
 $name = $env:ACTIVEGIT_SHORTCUT_NAME
+# Through Windows Terminal's ActiveGit profile when there is one (its font
+# is the one picked in the app); the command is passed too, so it still
+# starts ActiveGit before Windows Terminal has noticed the profile.
+$target = $exe
+$arguments = '--hold --pick'
+$wt = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wt.exe'
+if ($env:ACTIVEGIT_PROFILE -and (Test-Path -LiteralPath $wt)) {
+    $target = $wt
+    $arguments = '-p "' + $env:ACTIVEGIT_PROFILE + '" "' + $exe + '" --hold --pick'
+}
 if ($env:ACTIVEGIT_SHORTCUT_DIR) {
     $dirs = @($env:ACTIVEGIT_SHORTCUT_DIR)
 } else {
@@ -38,8 +50,8 @@ foreach ($dir in $dirs) {
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
     $path = Join-Path $dir ($name + '.lnk')
     $link = $shell.CreateShortcut($path)
-    $link.TargetPath = $exe
-    $link.Arguments = '--hold --pick'
+    $link.TargetPath = $target
+    $link.Arguments = $arguments
     $link.WorkingDirectory = [Environment]::GetFolderPath('UserProfile')
     $link.IconLocation = $exe + ',0'
     $link.Description = 'ActiveGit: a keyboard and mouse git client for the terminal'
@@ -58,6 +70,18 @@ pub fn install() -> Result<()> {
     let from_build_dir = exe
         .components()
         .any(|part| part.as_os_str().eq_ignore_ascii_case("target"));
+    // ActiveGit's own Windows Terminal profile, keeping a font already
+    // chosen. Without it the shortcut starts the program directly.
+    let profile = crate::font::fragment_dir().is_some_and(|dir| {
+        let font = crate::font::load(&dir);
+        match crate::font::save(&dir, &exe, &font) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("note: no Windows Terminal profile, so no font choice: {e:#}");
+                false
+            }
+        }
+    });
     let out = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
@@ -69,6 +93,10 @@ pub fn install() -> Result<()> {
         ])
         .env("ACTIVEGIT_EXE", &exe)
         .env("ACTIVEGIT_SHORTCUT_NAME", SHORTCUT_NAME)
+        .env(
+            "ACTIVEGIT_PROFILE",
+            if profile { crate::font::PROFILE } else { "" },
+        )
         .output()
         .context("cannot run PowerShell to create the shortcut")?;
     if !out.status.success() {
@@ -112,8 +140,9 @@ mod tests {
     fn script_starts_the_program_held_open_with_its_own_icon() {
         // The pieces a working, pinnable shortcut needs.
         for needle in [
-            "$link.TargetPath = $exe",
-            "$link.Arguments = '--hold --pick'",
+            "$link.TargetPath = $target",
+            "$arguments = '--hold --pick'",
+            "'-p \"' + $env:ACTIVEGIT_PROFILE",
             "$link.IconLocation = $exe + ',0'",
             "GetFolderPath('Programs')",
             "GetFolderPath('Desktop')",

@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod font;
 mod fuzzy;
 mod input;
 mod markdown;

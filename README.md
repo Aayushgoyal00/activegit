@@ -165,6 +165,14 @@ beside the one you picked.
 ActiveGit is a terminal program, so the window it runs in is always a
 terminal window; there is no separate graphical window.
 
+**Font.** The font belongs to the terminal, not to the program in it. With
+Windows Terminal, `--shortcut` also gives ActiveGit a profile of its own
+and the shortcut opens it, so its font can differ from your other
+terminals: open the actions menu (`?`), choose **Font**, pick a face
+(Consolas is the one VS Code uses) and a size with `←`/`→`, and press
+`enter`. It applies the next time ActiveGit is opened from the shortcut.
+In any other terminal, change the font in that terminal's settings.
+
 If Windows Terminal is your default terminal, the running window shows up
 on the taskbar under Windows Terminal's icon, next to the pinned ActiveGit
 icon; that is how Windows groups terminal windows.

@@ -307,6 +307,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::ConfirmPush => render_confirm_push_modal(frame, area, app),
         Mode::LlmSettings => render_llm_modal(frame, area, app),
         Mode::ThemePicker => render_theme_modal(frame, area, app),
+        Mode::FontPicker => render_font_modal(frame, area, app),
         Mode::ActionMenu => {
             if app.menu_return() == Mode::FullDiff {
                 render_fullscreen_diff(frame, area, app);
@@ -399,6 +400,7 @@ pub fn render_workspace(frame: &mut Frame, ws: &Workspace) {
         Mode::ConfirmPush => render_confirm_push_modal(frame, body, app),
         Mode::LlmSettings => render_llm_modal(frame, body, app),
         Mode::ThemePicker => render_theme_modal(frame, body, app),
+        Mode::FontPicker => render_font_modal(frame, body, app),
         Mode::ActionMenu => {
             if app.menu_return() == Mode::FullDiff {
                 render_fullscreen_diff(frame, body, app);
@@ -2338,6 +2340,7 @@ fn footer_hints(app: &App, theme: Theme, multi: bool) -> Paragraph<'static> {
         Mode::FindFile => "type to filter · ↑/↓ move · ←/→ edit · enter open · esc cancel",
         Mode::LlmSettings => "tab/↑↓ switch field · ←/→ choose/edit · enter save · esc cancel",
         Mode::ThemePicker => "↑/↓ preview · enter keep + save · esc cancel",
+        Mode::FontPicker => "↑/↓ font · ←/→ size · enter save · esc cancel",
         Mode::ActionMenu => "type to filter · ↑/↓ move · enter run · esc close",
         Mode::Confirm => "enter / y confirm · esc / n cancel",
         Mode::Help => "j/k scroll · PgUp/PgDn page · g/G top/bottom · esc close",
@@ -2783,6 +2786,50 @@ fn render_theme_modal(frame: &mut Frame, area: Rect, app: &App) {
     app.set_hit(HitMap::ThemePicker, hit);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
     popup_buttons(frame, app, popup, &[("Keep", OK), ("Cancel", CANCEL)]);
+}
+
+/// Font picker: the faces to choose from, the size in the title. The font
+/// belongs to the terminal, so nothing on screen changes until ActiveGit
+/// is opened again; the last line says so.
+fn render_font_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = app.theme();
+    let mut names: Vec<&str> = vec![crate::font::TERMINAL_DEFAULT];
+    names.extend(crate::font::FACES);
+    let selected = app.font_selected();
+    let popup = centered_rect(area, 46, names.len() as u16 + 4);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
+    let block = panel_block(
+        true,
+        theme,
+        format!(" Font \u{b7} size {} ", app.font_size()),
+    );
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut hit: Vec<(u16, usize)> = Vec::new();
+    for (row, name) in names.iter().enumerate() {
+        hit.push((popup.y + 1 + lines.len() as u16, row));
+        let style = if row == selected {
+            selection_style(theme)
+        } else {
+            Style::default().fg(theme.fg).bg(theme.bg)
+        };
+        let marker = if row == selected { "> " } else { "  " };
+        let pad = inner_w.saturating_sub(marker.len() + name.len());
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), style),
+            Span::styled(name.to_string(), style),
+            Span::styled(" ".repeat(pad), style),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        " applies the next time ActiveGit opens",
+        Style::default().fg(theme.hint),
+    ));
+    app.set_hit(HitMap::FontPicker, hit);
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    popup_buttons(frame, app, popup, &[("Save", OK), ("Cancel", CANCEL)]);
 }
 
 /// Actions menu (`?`): filter line, then every matching action with its
@@ -6455,5 +6502,25 @@ mod tests {
         tiny.draw(|f| render_start(f, &mut start, Theme::default_theme()))
             .unwrap();
         assert!(start.hits.is_empty());
+    }
+    #[test]
+    fn font_picker_lists_the_faces_and_shows_the_size() {
+        use crossterm::event::KeyCode;
+        let (_dir, mut app) = with_files(&[("a.txt", FileState::Unstaged)]);
+        let dir = tempfile::TempDir::new().unwrap();
+        app.set_font_dir(Some(dir.path().to_path_buf()));
+        app.begin_font_picker();
+        let s = screen(&app, 100, 32);
+        for name in crate::font::FACES {
+            assert!(s.contains(name), "{name} missing:\n{s}");
+        }
+        assert!(s.contains("> Terminal default"), "{s}");
+        assert!(s.contains("size 12"), "{s}");
+        assert!(s.contains("next time ActiveGit opens"), "{s}");
+        app.on_key(KeyCode::Down);
+        app.on_key(KeyCode::Right);
+        let s = screen(&app, 100, 32);
+        assert!(s.contains("> Consolas"), "{s}");
+        assert!(s.contains("size 13"), "{s}");
     }
 }

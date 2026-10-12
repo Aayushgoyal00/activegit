@@ -67,6 +67,9 @@ pub enum Mode {
     /// In-TUI theme picker (`T`): moving the selection previews the theme
     /// live, Enter keeps it and saves `[theme]`, Esc restores the old one.
     ThemePicker,
+    /// Font picker (actions menu): the face and size of ActiveGit's own
+    /// Windows Terminal profile. Enter saves it for the next launch.
+    FontPicker,
     /// Actions menu (`?`): a searchable list of every action. The draft is
     /// the filter; Enter runs the highlighted entry.
     ActionMenu,
@@ -428,6 +431,14 @@ pub struct App {
     /// theme to restore on Esc.
     theme_selected: usize,
     theme_before: Theme,
+    /// Font picker: the highlighted row (0 is the terminal's own face,
+    /// then `font::FACES`) and the size being chosen.
+    font_selected: usize,
+    font_size: u8,
+    /// Where ActiveGit's Windows Terminal profile lives; `None` where
+    /// there is none (other systems, tests).
+    font_dir: Option<std::path::PathBuf>,
+    font_hit: std::cell::RefCell<Vec<(u16, usize)>>,
     browser_hit: std::cell::RefCell<Vec<(u16, usize)>>,
 }
 
@@ -454,6 +465,7 @@ pub(crate) enum HitMap {
     Finder,
     Browser,
     ThemePicker,
+    FontPicker,
     ActionMenu,
 }
 
@@ -917,6 +929,14 @@ impl App {
             workspace_keys: Vec::new(),
             theme_selected: 0,
             theme_before: config.theme,
+            font_selected: 0,
+            font_size: crate::font::DEFAULT_SIZE,
+            font_dir: if cfg!(test) {
+                None
+            } else {
+                crate::font::fragment_dir()
+            },
+            font_hit: std::cell::RefCell::new(Vec::new()),
             browser_hit: std::cell::RefCell::new(Vec::new()),
         };
         app.refresh();
@@ -1341,6 +1361,114 @@ impl App {
         }
     }
 
+    pub fn font_selected(&self) -> usize {
+        self.font_selected
+    }
+
+    pub fn font_size(&self) -> u8 {
+        self.font_size
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_font_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.font_dir = dir;
+    }
+
+    /// Open the font picker on the font the profile uses now.
+    pub fn begin_font_picker(&mut self) {
+        if self.mode != Mode::Normal {
+            return;
+        }
+        self.error = None;
+        self.notice = None;
+        let Some(dir) = self.font_dir.clone() else {
+            self.error = Some(
+                "the font belongs to your terminal: change it in the terminal's settings \
+                 (ActiveGit can set it only for its Windows Terminal profile)"
+                    .to_string(),
+            );
+            return;
+        };
+        let font = crate::font::load(&dir);
+        self.font_selected = font
+            .face
+            .as_deref()
+            .and_then(|face| crate::font::FACES.iter().position(|f| *f == face))
+            .map_or(0, |i| i + 1);
+        self.font_size = font.size;
+        self.mode = Mode::FontPicker;
+    }
+
+    /// Rows in the font picker: the terminal's own face, then the list.
+    fn font_rows() -> usize {
+        crate::font::FACES.len() + 1
+    }
+
+    fn font_picker_resize(&mut self, delta: i8) {
+        let size = self.font_size as i16 + delta as i16;
+        self.font_size =
+            size.clamp(crate::font::MIN_SIZE as i16, crate::font::MAX_SIZE as i16) as u8;
+    }
+
+    /// Enter: write the font into ActiveGit's terminal profile.
+    fn confirm_font_picker(&mut self) {
+        self.mode = Mode::Normal;
+        let Some(dir) = self.font_dir.clone() else {
+            return;
+        };
+        let font = crate::font::Font {
+            face: self
+                .font_selected
+                .checked_sub(1)
+                .and_then(|i| crate::font::FACES.get(i))
+                .map(|face| face.to_string()),
+            size: self.font_size,
+        };
+        let saved = std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| crate::font::save(&dir, &exe, &font));
+        match saved {
+            Ok(()) => {
+                self.notice = Some(format!(
+                    "font {} saved: it shows the next time ActiveGit is opened from its shortcut",
+                    font.describe()
+                ));
+            }
+            Err(e) => self.error = Some(format!("font not saved: {e:#}")),
+        }
+    }
+
+    fn on_key_font_picker(&mut self, key: KeyCode) {
+        let last = Self::font_rows() - 1;
+        match key {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                self.font_selected = (self.font_selected + 1) % (last + 1);
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                self.font_selected = (self.font_selected + last) % (last + 1);
+            }
+            KeyCode::Home => self.font_selected = 0,
+            KeyCode::End => self.font_selected = last,
+            KeyCode::Right | KeyCode::Char('l' | '+' | '=') => self.font_picker_resize(1),
+            KeyCode::Left | KeyCode::Char('h' | '-') => self.font_picker_resize(-1),
+            KeyCode::Enter => self.confirm_font_picker(),
+            KeyCode::Esc => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    /// Click a font row: select it, or keep it on a double click.
+    fn click_font_picker(&mut self, row: u16) {
+        let Some(index) = self.hit(HitMap::FontPicker, row) else {
+            return;
+        };
+        if index == self.font_selected && self.double_click {
+            self.confirm_font_picker();
+        } else {
+            self.font_selected = index;
+        }
+    }
+
     /// `?`: open the actions menu for the focused panel, or for the
     /// fullscreen diff.
     pub fn begin_action_menu(&mut self) {
@@ -1440,6 +1568,7 @@ impl App {
             MenuAction::Footer(action) => self.click_footer_button(action),
             MenuAction::Refresh => self.refresh_all(),
             MenuAction::Help => self.begin_help(),
+            MenuAction::Font => self.begin_font_picker(),
             MenuAction::Fetch => self.start_fetch(),
             MenuAction::ForcePush => self.request_danger(Danger::ForcePush),
             MenuAction::Amend => self.begin_amend(),
@@ -1695,6 +1824,7 @@ impl App {
             HitMap::Finder => *self.finder_hit.borrow_mut() = rows,
             HitMap::Browser => *self.browser_hit.borrow_mut() = rows,
             HitMap::ThemePicker => *self.theme_hit.borrow_mut() = rows,
+            HitMap::FontPicker => *self.font_hit.borrow_mut() = rows,
             HitMap::ActionMenu => *self.menu_hit.borrow_mut() = rows,
         }
     }
@@ -1713,6 +1843,7 @@ impl App {
             HitMap::Finder => self.finder_hit.borrow(),
             HitMap::Browser => self.browser_hit.borrow(),
             HitMap::ThemePicker => self.theme_hit.borrow(),
+            HitMap::FontPicker => self.font_hit.borrow(),
             HitMap::ActionMenu => self.menu_hit.borrow(),
         }
     }
@@ -2810,6 +2941,7 @@ impl App {
             self.mode,
             Mode::FindFile
                 | Mode::ThemePicker
+                | Mode::FontPicker
                 | Mode::ActionMenu
                 | Mode::Confirm
                 | Mode::ConfirmPush
@@ -2845,6 +2977,10 @@ impl App {
         }
         if self.mode == Mode::ThemePicker {
             self.on_key_theme_picker(key);
+            return;
+        }
+        if self.mode == Mode::FontPicker {
+            self.on_key_font_picker(key);
             return;
         }
         if self.mode == Mode::ActionMenu {
@@ -2926,6 +3062,7 @@ impl App {
                     | Mode::ConfirmPush
                     | Mode::LlmSettings
                     | Mode::ThemePicker
+                    | Mode::FontPicker
                     | Mode::ActionMenu
                     | Mode::Confirm
                     | Mode::Help => {}
@@ -3624,6 +3761,10 @@ impl App {
                 self.click_theme_picker(row);
                 return;
             }
+            Mode::FontPicker => {
+                self.click_font_picker(row);
+                return;
+            }
             Mode::ActionMenu => {
                 self.click_action_menu(row);
                 return;
@@ -3830,6 +3971,11 @@ impl App {
                 let last = Theme::names().count().saturating_sub(1) as isize;
                 let next = (self.theme_selected as isize + step).clamp(0, last);
                 return self.theme_picker_select(next as usize);
+            }
+            Mode::FontPicker => {
+                let last = Self::font_rows() as isize - 1;
+                self.font_selected = (self.font_selected as isize + step).clamp(0, last) as usize;
+                return;
             }
             Mode::Help => return self.help_scroll_by(step * 3),
             Mode::FullDiff => return self.wheel_diff(step * 3),
@@ -10032,5 +10178,81 @@ mod tests {
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "mine\n"
         );
+    }
+    #[test]
+    fn font_picker_saves_face_and_size_to_the_terminal_profile() {
+        use crate::font::{self, Font};
+        let mut fx = harness(&["a.txt"]);
+        // Nowhere to keep a font (other systems): say so, open nothing.
+        fx.app.begin_font_picker();
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert!(fx.app.error().unwrap_or("").contains("terminal"));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        fx.app.set_font_dir(Some(dir.path().to_path_buf()));
+        fx.app.begin_font_picker();
+        assert_eq!(fx.app.mode(), Mode::FontPicker);
+        assert_eq!(fx.app.font_selected(), 0, "starts on the terminal's own");
+        assert_eq!(fx.app.font_size(), font::DEFAULT_SIZE);
+        // Esc saves nothing.
+        fx.app.on_key(KeyCode::Down);
+        fx.app.on_key(KeyCode::Esc);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(font::load(dir.path()), Font::default());
+
+        // Consolas is the first face; two sizes up; Enter saves.
+        fx.app.begin_font_picker();
+        fx.app.on_key(KeyCode::Down);
+        fx.app.on_key(KeyCode::Right);
+        fx.app.on_key(KeyCode::Right);
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        let saved = Font {
+            face: Some("Consolas".into()),
+            size: font::DEFAULT_SIZE + 2,
+        };
+        assert_eq!(font::load(dir.path()), saved);
+        assert!(fx.app.notice().unwrap_or("").contains("Consolas 14"));
+
+        // Reopening starts on what was saved; the size stops at the ends.
+        fx.app.begin_font_picker();
+        assert_eq!(fx.app.font_selected(), 1);
+        assert_eq!(fx.app.font_size(), 14);
+        for _ in 0..40 {
+            fx.app.on_key(KeyCode::Left);
+        }
+        assert_eq!(fx.app.font_size(), font::MIN_SIZE);
+        // Up from the first row wraps to the last face.
+        fx.app.on_key(KeyCode::Home);
+        fx.app.on_key(KeyCode::Up);
+        assert_eq!(fx.app.font_selected(), font::FACES.len());
+        // A click selects; a click on the selected row twice keeps it.
+        fx.app
+            .set_hit(HitMap::FontPicker, vec![(5, 0), (6, 1), (7, 2)]);
+        fx.app.on_mouse_down(10, 7);
+        assert_eq!(fx.app.font_selected(), 2);
+        assert_eq!(fx.app.mode(), Mode::FontPicker);
+        fx.app.on_mouse_down(10, 7);
+        assert_eq!(fx.app.mode(), Mode::Normal);
+        assert_eq!(
+            font::load(dir.path()),
+            Font {
+                face: Some(font::FACES[1].into()),
+                size: font::MIN_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn font_is_in_the_actions_menu() {
+        let mut fx = harness(&["a.txt"]);
+        let dir = tempfile::TempDir::new().unwrap();
+        fx.app.set_font_dir(Some(dir.path().to_path_buf()));
+        fx.app.on_key(KeyCode::Char('?'));
+        for c in "font".chars() {
+            fx.app.on_key(KeyCode::Char(c));
+        }
+        fx.app.on_key(KeyCode::Enter);
+        assert_eq!(fx.app.mode(), Mode::FontPicker);
     }
 }

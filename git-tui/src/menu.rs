@@ -16,6 +16,7 @@ pub(crate) enum MenuAction {
     Footer(FooterAction),
     Refresh,
     Help,
+    Font,
     Fetch,
     ForcePush,
     Amend,
@@ -175,6 +176,7 @@ pub(crate) fn entries(context: MenuContext, operation: Option<&'static str>) -> 
             M::Workspace(WorkspaceRequest::Close),
         ),
         entry("Settings", "Theme", M::Footer(F::Theme)),
+        entry("Settings", "Font", M::Font),
         entry("Settings", "LLM setup", M::LlmSettings),
         entry("Settings", "Help: all keys", M::Help),
         entry("Settings", "Quit", M::Quit),
@@ -239,7 +241,7 @@ pub(crate) fn key_hint(action: MenuAction, keys: &KeyBindings) -> String {
         M::Refresh => &keys.refresh,
         M::Fetch => &keys.sync_fetch,
         M::Undo => &keys.undo,
-        M::ForcePush | M::Amend | M::AbortOperation | M::ContinueOperation => &[],
+        M::ForcePush | M::Amend | M::AbortOperation | M::ContinueOperation | M::Font => &[],
         M::Help => &[KeyCode::F(1)],
         M::MarkdownPreview => &keys.toggle_markdown_preview,
         M::LlmSettings => &keys.llm_settings,
@@ -505,6 +507,7 @@ mod tests {
                 "Stash changes",
                 "Push",
                 "Theme",
+                "Font",
                 "Quit",
             ] {
                 assert!(has(focus, label), "{label} missing with {focus:?} focused");

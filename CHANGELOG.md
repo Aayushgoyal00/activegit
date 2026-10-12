@@ -82,6 +82,9 @@ built from these entries by cargo-dist.
   more step up lists the home folder and every drive, so a repository on
   `C:` is reachable from one on `E:`.
 - The terminal window or tab is titled "ActiveGit".
+- **Font picker** (actions menu, Windows Terminal): `--shortcut` gives
+  ActiveGit its own Windows Terminal profile, and **Font** in the actions
+  menu sets that profile's face and size without touching other terminals.
 
 ### Features
 
