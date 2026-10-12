@@ -82,10 +82,6 @@ built from these entries by cargo-dist.
   more step up lists the home folder and every drive, so a repository on
   `C:` is reachable from one on `E:`.
 - The terminal window or tab is titled "ActiveGit".
-- **Mouse pointer**: a hand over buttons, tabs and popup rows, resize
-  arrows over the panel dividers, in terminals that support pointer shapes
-  (OSC 22: kitty, Ghostty, foot, WezTerm). Others keep their own pointer;
-  the start screen also highlights the row under the mouse.
 
 ### Features
 

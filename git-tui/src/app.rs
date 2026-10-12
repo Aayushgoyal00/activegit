@@ -468,19 +468,6 @@ pub(crate) enum VisualMode {
 /// end_col), linewise)`; see `App::visual_selection`.
 pub(crate) type VisualSel = ((usize, usize), (usize, usize), bool);
 
-/// What the mouse pointer should look like over a cell, for terminals that
-/// let a program say (see `main::PointerShape`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pointer {
-    Default,
-    /// Over something a click acts on.
-    Hand,
-    /// Over the divider between the side panels and the diff.
-    ResizeColumns,
-    /// Over a divider between two side panels.
-    ResizeRows,
-}
-
 /// Whether screen cell `(col, row)` falls inside `rect`.
 fn mouse_in(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
     col >= rect.x
@@ -502,8 +489,8 @@ pub(crate) struct Visual {
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,
-    /// Shown dimmed after the name at the places level: a drive's volume
-    /// name and free space, "home folder", "recent project".
+    /// Shown dimmed after the name at the places level: "home folder",
+    /// "recent project".
     pub note: String,
     /// The directory itself contains `.git` (repo root): badged `[repo]`.
     pub is_repo_root: bool,
@@ -729,12 +716,9 @@ impl OpenBrowser {
 /// filesystem root elsewhere), the home folder, then the recent projects.
 /// Names are full paths.
 fn places(recents: &[std::path::PathBuf]) -> Vec<DirEntry> {
-    let mut found: Vec<(std::path::PathBuf, String)> = crate::drives::list()
+    let mut found: Vec<(std::path::PathBuf, String)> = drives()
         .into_iter()
-        .map(|drive| {
-            let note = drive.note();
-            (drive.root, note)
-        })
+        .map(|drive| (drive, String::new()))
         .collect();
     found.extend(git_tui_core::repo::home_dir().map(|home| (home, "home folder".to_string())));
     found.extend(
@@ -754,6 +738,21 @@ fn places(recents: &[std::path::PathBuf]) -> Vec<DirEntry> {
         }
     }
     out
+}
+
+/// The roots a path can start from: `C:\`, `D:\`, ... on Windows.
+#[cfg(windows)]
+fn drives() -> Vec<std::path::PathBuf> {
+    // A: and B: are floppy letters; probing an empty one can stall.
+    ('C'..='Z')
+        .map(|letter| std::path::PathBuf::from(format!("{letter}:\\")))
+        .filter(|drive| drive.is_dir())
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn drives() -> Vec<std::path::PathBuf> {
+    vec![std::path::PathBuf::from("/")]
 }
 
 /// Subdirectories of `dir`, sorted by name. Files are hidden: only
@@ -1727,63 +1726,6 @@ impl App {
 
     pub(crate) fn browser_selected_index(&self) -> usize {
         self.open_browser.as_ref().map(|b| b.selected).unwrap_or(0)
-    }
-
-    /// The pointer for cell `(col, row)`: a hand over buttons and list
-    /// rows in popups, resize arrows over the panel dividers.
-    pub(crate) fn pointer_at(&self, col: u16, row: u16) -> Pointer {
-        let on_button = self
-            .clicks
-            .borrow()
-            .iter()
-            .any(|(rect, _)| mouse_in(col, row, *rect));
-        if on_button {
-            return Pointer::Hand;
-        }
-        let list = match self.mode {
-            Mode::FindFile => Some(HitMap::Finder),
-            Mode::ThemePicker => Some(HitMap::ThemePicker),
-            Mode::ActionMenu => Some(HitMap::ActionMenu),
-            Mode::OpenProject => Some(HitMap::Browser),
-            _ => None,
-        };
-        if let Some(list) = list {
-            return match self.hit(list, row) {
-                Some(_) => Pointer::Hand,
-                None => Pointer::Default,
-            };
-        }
-        let buttons = footer_buttons(self);
-        if self.mode == Mode::FullDiff {
-            let Some(rect) = self.last_full_rect.get() else {
-                return Pointer::Default;
-            };
-            let first = rect.x.saturating_add(1);
-            let on = row == self.last_full_btn_y.get()
-                && col >= first
-                && footer_button_at(&buttons, (col - first) as usize).is_some();
-            return if on { Pointer::Hand } else { Pointer::Default };
-        }
-        if self.mode != Mode::Normal {
-            return Pointer::Default;
-        }
-        let Some(layout) = self.last_layout.get() else {
-            return Pointer::Default;
-        };
-        let footer = layout.footer;
-        if mouse_in(col, row, footer) {
-            let on =
-                row == footer.y && footer_button_at(&buttons, (col - footer.x) as usize).is_some();
-            return if on { Pointer::Hand } else { Pointer::Default };
-        }
-        let dx = rail_divider_x(&layout);
-        if row >= layout.status.y && row < footer.y && (col == dx || col + 1 == dx) {
-            return Pointer::ResizeColumns;
-        }
-        if col < dx && panel_divider_ys(&layout).contains(&row) {
-            return Pointer::ResizeRows;
-        }
-        Pointer::Default
     }
 
     pub(crate) fn browser_hit_at(&self, row: u16) -> Option<usize> {

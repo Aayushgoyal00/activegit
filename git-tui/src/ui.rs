@@ -3221,7 +3221,6 @@ pub(crate) fn browser_lines(
     top: u16,
     open_roots: &[std::path::PathBuf],
     path_visible: &str,
-    hover: Option<usize>,
 ) -> (Vec<Line<'static>>, Vec<(u16, usize)>) {
     use crate::app::BrowserRow;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
@@ -3290,12 +3289,6 @@ pub(crate) fn browser_lines(
         let selected = start + row == cursor;
         let style = if selected {
             selection_style(theme)
-        } else if hover == Some(index) {
-            // The row under the mouse: one click selects it.
-            Style::default()
-                .fg(theme.border_focused)
-                .bg(theme.bg)
-                .add_modifier(Modifier::UNDERLINED)
         } else {
             Style::default().fg(theme.fg).bg(theme.bg)
         };
@@ -3411,7 +3404,6 @@ pub fn render_start(frame: &mut Frame, screen: &mut crate::start::StartScreen, t
         list.y + 1,
         &[],
         &path_visible,
-        screen.hover,
     );
     screen.hits = hits;
     let block = panel_block(true, theme, " Open project ".to_string());
@@ -3473,7 +3465,6 @@ fn render_open_browser_modal(
         popup.y.saturating_add(1),
         open_roots,
         &path_visible,
-        None,
     );
     app.set_hit(HitMap::Browser, hit);
     frame.render_widget(Paragraph::new(lines).block(block), popup);

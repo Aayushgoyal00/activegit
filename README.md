@@ -154,7 +154,7 @@ to taskbar** (on Windows 11 it is under *Show more options*); Windows does
 not let a program pin itself.
 
 Clicking it opens a terminal window on the start screen, laid out like
-This PC: every drive with its name and free space, your home folder, then
+This PC: every drive, your home folder, then
 the projects you had open last time. Pick one with the
 arrow keys or the mouse and press `enter`; `→` goes into a folder, `←`
 goes back up (past the top of a drive to the list of drives), typing

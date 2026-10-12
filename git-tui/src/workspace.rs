@@ -499,25 +499,6 @@ impl Workspace {
         self.run_menu_request();
     }
 
-    /// What the mouse pointer should look like over `(col, row)`.
-    pub fn pointer_at(&self, col: u16, row: u16) -> crate::app::Pointer {
-        use crate::app::Pointer;
-        if self.show_welcome {
-            return Pointer::Default;
-        }
-        let on_tab = self.apps.len() > 1
-            && row == self.bar_y.get()
-            && self
-                .bar_hit
-                .borrow()
-                .iter()
-                .any(|(start, end, _)| col >= *start && col < *end);
-        if on_tab && self.current().mode() == Mode::Normal {
-            return Pointer::Hand;
-        }
-        self.current().pointer_at(col, row)
-    }
-
     /// Click a project-browser row: select it, or activate it when it is
     /// already selected (mouse double-click without a timer).
     fn click_browser(&mut self, col: u16, row: u16) {
@@ -1740,25 +1721,15 @@ mod tests {
         assert!(!b.view.is_empty());
         assert!(b.parent().is_none());
         // Drives (or `/`) come first, as in This PC, and can be entered.
-        let drive = std::path::PathBuf::from(&b.view[0].name);
+        let last = 0;
+        let drive = std::path::PathBuf::from(&b.view[last].name);
+        assert!(b.view.iter().any(|e| e.note == "home folder"));
         assert!(
             drive.parent().is_none(),
             "{} is not a root",
             drive.display()
         );
-        assert!(b.view.iter().any(|e| e.note == "home folder"));
-        // Over a row the pointer is a hand, off the list it is not.
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
-        terminal
-            .draw(|f| crate::ui::render_workspace(f, &ws))
-            .unwrap();
-        let row = (0..40)
-            .find(|y| ws.current().browser_hit_at(*y) == Some(0))
-            .expect("the first place is on screen");
-        assert_eq!(ws.pointer_at(60, row), crate::app::Pointer::Hand);
-        assert_eq!(ws.pointer_at(60, 0), crate::app::Pointer::Default);
-        ws.current_mut().set_browser_selected(0);
+        ws.current_mut().set_browser_selected(last);
         ws.on_key(KeyCode::Enter);
         assert_eq!(ws.current().mode(), Mode::OpenProject);
         let b = ws.current().open_browser().unwrap();
@@ -1771,30 +1742,5 @@ mod tests {
         ws.on_key(KeyCode::Char('~'));
         ws.on_key(KeyCode::Char('~'));
         assert!(ws.current().open_browser().unwrap().view.is_empty());
-    }
-
-    #[test]
-    fn pointer_is_a_hand_over_buttons_and_arrows_over_dividers() {
-        use crate::app::Pointer;
-        let a = init_repo_with_file("a", "a.txt", "a\n");
-        let ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
-        terminal
-            .draw(|f| crate::ui::render_workspace(f, &ws))
-            .unwrap();
-        let cells: Vec<Pointer> = (0..40u16)
-            .flat_map(|row| (0..120u16).map(move |col| (col, row)))
-            .map(|(col, row)| ws.pointer_at(col, row))
-            .collect();
-        // The footer has buttons, the layout has both kinds of divider,
-        // and most of the screen is none of them.
-        for wanted in [Pointer::Hand, Pointer::ResizeColumns, Pointer::ResizeRows] {
-            assert!(cells.contains(&wanted), "no {wanted:?} anywhere");
-        }
-        let plain = cells.iter().filter(|p| **p == Pointer::Default).count();
-        assert!(plain > cells.len() / 2, "{plain} plain cells");
-        // Buttons live on the footer's first row only.
-        assert!(cells[..120 * 30].iter().all(|p| *p != Pointer::Hand));
     }
 }

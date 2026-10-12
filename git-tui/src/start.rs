@@ -5,7 +5,7 @@
 //! lists the recent projects, the home folder and the drives, and browses
 //! folders from there with the same picker as `o` inside the app.
 
-use crate::app::{BrowserRow, OpenBrowser, Pointer};
+use crate::app::{BrowserRow, OpenBrowser};
 use crate::config::Theme;
 use crate::input::{self, Chord, Input};
 use anyhow::{Context, Result};
@@ -36,8 +36,6 @@ pub struct StartScreen {
     pub(crate) confirm_init: Option<PathBuf>,
     /// Screen row to list index, recorded while drawing (mouse clicks).
     pub(crate) hits: Vec<(u16, usize)>,
-    /// The list row under the mouse, drawn highlighted.
-    pub(crate) hover: Option<usize>,
     last_click: Option<(Instant, u16)>,
 }
 
@@ -49,7 +47,6 @@ impl StartScreen {
             path_line: String::new(),
             confirm_init: None,
             hits: Vec::new(),
-            hover: None,
             last_click: None,
         }
     }
@@ -143,16 +140,6 @@ impl StartScreen {
         None
     }
 
-    /// The mouse moved to screen row `row`: remember the list row there.
-    /// Returns the pointer to show.
-    pub fn on_hover(&mut self, row: u16) -> Pointer {
-        self.hover = self.hits.iter().find(|(y, _)| *y == row).map(|(_, i)| *i);
-        match self.hover {
-            Some(_) => Pointer::Hand,
-            None => Pointer::Default,
-        }
-    }
-
     pub fn on_wheel(&mut self, up: bool) {
         self.browser.move_cursor(if up { -1 } else { 1 });
     }
@@ -224,7 +211,6 @@ pub fn choose(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     theme: Theme,
     recents: Vec<PathBuf>,
-    pointer: &mut crate::PointerShape,
 ) -> Result<Choice> {
     let mut screen = StartScreen::new(recents);
     loop {
@@ -264,10 +250,6 @@ pub fn choose(
                 }
                 Event::Mouse(m) => match m.kind {
                     MouseEventKind::Down(MouseButton::Left) => screen.on_click(m.row),
-                    MouseEventKind::Moved => {
-                        pointer.set(screen.on_hover(m.row));
-                        None
-                    }
                     MouseEventKind::ScrollUp => {
                         screen.on_wheel(true);
                         None
@@ -396,11 +378,6 @@ mod tests {
         assert_eq!(screen.on_click(6), None);
         assert_eq!(screen.browser.selected, last);
         assert!(matches!(screen.on_click(6), Some(Choice::Open(_))));
-        // Moving over a row highlights it and asks for the hand pointer.
-        assert_eq!(screen.on_hover(5), Pointer::Hand);
-        assert_eq!(screen.hover, Some(0));
-        assert_eq!(screen.on_hover(40), Pointer::Default);
-        assert_eq!(screen.hover, None);
         // A click off the list does nothing.
         assert_eq!(screen.on_click(40), None);
     }
