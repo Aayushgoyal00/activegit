@@ -2,9 +2,9 @@
 //! desktop (Windows), so it can be started with a click and pinned to the
 //! taskbar instead of typed into a terminal.
 //!
-//! The shortcut starts `activegit.exe --hold` in the user's home folder.
-//! With no path, activegit reopens the last session's projects, or asks
-//! for a repository when there is none yet; `--hold` keeps the window open
+//! The shortcut starts `activegit.exe --hold --pick` in the user's home
+//! folder. `--pick` opens the start screen (recent projects, home folder,
+//! drives) so the project is chosen first; `--hold` keeps the window open
 //! on a startup error so the message can be read.
 
 use anyhow::Result;
@@ -27,6 +27,10 @@ if ($env:ACTIVEGIT_SHORTCUT_DIR) {
     $dirs = @($env:ACTIVEGIT_SHORTCUT_DIR)
 } else {
     $dirs = @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))
+    # A shortcut already pinned to the taskbar is a copy: bring it up to date
+    # too, but never pin one that is not there.
+    $pinned = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+    if (Test-Path -LiteralPath (Join-Path $pinned ($name + '.lnk'))) { $dirs += $pinned }
 }
 $shell = New-Object -ComObject WScript.Shell
 foreach ($dir in $dirs) {
@@ -35,7 +39,7 @@ foreach ($dir in $dirs) {
     $path = Join-Path $dir ($name + '.lnk')
     $link = $shell.CreateShortcut($path)
     $link.TargetPath = $exe
-    $link.Arguments = '--hold'
+    $link.Arguments = '--hold --pick'
     $link.WorkingDirectory = [Environment]::GetFolderPath('UserProfile')
     $link.IconLocation = $exe + ',0'
     $link.Description = 'ActiveGit: a keyboard and mouse git client for the terminal'
@@ -109,7 +113,7 @@ mod tests {
         // The pieces a working, pinnable shortcut needs.
         for needle in [
             "$link.TargetPath = $exe",
-            "$link.Arguments = '--hold'",
+            "$link.Arguments = '--hold --pick'",
             "$link.IconLocation = $exe + ',0'",
             "GetFolderPath('Programs')",
             "GetFolderPath('Desktop')",
@@ -151,7 +155,7 @@ mod tests {
         let text = String::from_utf8_lossy(&read_back.stdout).to_lowercase();
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         assert!(lines[0].ends_with("activegit.exe"), "target: {lines:?}");
-        assert_eq!(lines[1], "--hold");
+        assert_eq!(lines[1], "--hold --pick");
         assert!(lines[2].ends_with("activegit.exe,0"), "icon: {lines:?}");
     }
 }

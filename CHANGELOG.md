@@ -74,9 +74,14 @@ built from these entries by cargo-dist.
 - **`activegit --shortcut`** (Windows) adds ActiveGit to the Start menu and
   the desktop, ready to pin to the taskbar: click it instead of opening a
   terminal and typing.
-- Started outside a repository with no previous session, it asks which
-  repository to open (and offers `git init`) instead of exiting with an
-  error.
+- **Start screen** (`activegit --pick`, which the shortcut uses): choose
+  the project to open from the recent projects, the home folder and the
+  drives, by keyboard or mouse, before anything opens. Also shown instead
+  of an error when started outside a repository with no previous session.
+- The directory browser (`o`) no longer stops at the top of a drive: one
+  more step up lists the home folder and every drive, so a repository on
+  `C:` is reachable from one on `E:`.
+- The terminal window or tab is titled "ActiveGit".
 
 ### Features
 

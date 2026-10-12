@@ -6,6 +6,7 @@ mod markdown;
 mod menu;
 mod session;
 mod shortcut;
+mod start;
 mod syntax;
 mod ui;
 mod welcome;
@@ -21,7 +22,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
 use git_tui_core::repo::Repo;
 use input::Input;
@@ -29,7 +30,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use session::Session;
 use std::ffi::OsString;
-use std::io::{stdout, IsTerminal, Write};
+use std::io::{stdout, IsTerminal};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use workspace::Workspace;
@@ -75,17 +76,27 @@ fn start(cli: Cli) -> Result<()> {
     }
     let has_explicit_paths = !cli.paths.is_empty();
     let no_welcome_flag = cli.no_welcome;
-    let (paths, restored_current) = resolve_startup_paths(cli.paths);
+    let interactive = std::io::stdin().is_terminal();
+    let (mut paths, mut restored_current) = resolve_startup_paths(cli.paths);
+    // `--pick` (the shortcut): choose the project first instead of landing
+    // in whichever one was open last.
+    if cli.pick && !has_explicit_paths && interactive {
+        match pick_project(&config, paths.clone())? {
+            Some(root) => {
+                let index = project_index(&mut paths, root);
+                restored_current = Some(index);
+            }
+            None => return Ok(()),
+        }
+    }
     let mut workspace = match Workspace::open(paths, config.clone()) {
         Ok(workspace) => workspace,
-        // Started somewhere that is not a repository (a shortcut starts in
-        // the home folder) with nothing to restore: ask instead of failing.
-        Err(e) if !has_explicit_paths && std::io::stdin().is_terminal() => {
-            match ask_for_repository(&e.to_string())? {
-                Some(path) => Workspace::open(vec![path], config)?,
-                None => return Ok(()),
-            }
-        }
+        // Started somewhere that is not a repository with nothing to
+        // restore: ask instead of failing.
+        Err(_) if !has_explicit_paths && interactive => match pick_project(&config, Vec::new())? {
+            Some(root) => Workspace::open(vec![root], config.clone())?,
+            None => return Ok(()),
+        },
         Err(e) => return Err(e),
     };
     workspace.set_session_path(Session::default_path());
@@ -103,23 +114,7 @@ fn start(cli: Cli) -> Result<()> {
         workspace.save_session();
     }
 
-    enable_raw_mode().context("cannot enable raw mode")?;
-    let mut out = stdout();
-    // Alternate screen = the terminal saves the current view and shows a
-    // scratch buffer; on `LeaveAlternateScreen` the shell contents reappear.
-    // All drawing from here on is just ANSI escape sequences (cursor moves,
-    // colors) emitted by ratatui — you never write them by hand.
-    execute!(out, EnterAlternateScreen).context("cannot enter alternate screen")?;
-    // `[ui] mouse = false` leaves the mouse to the terminal (native text
-    // selection); everything stays reachable from the keyboard.
-    if workspace.mouse_enabled() {
-        let _ = execute!(out, EnableMouseCapture);
-    }
-    // Best effort: older Windows consoles support neither. Pastes then
-    // arrive as key presses and are caught by `input::paste_text`.
-    let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
-    let backend = CrosstermBackend::new(out);
-    let mut terminal = Terminal::new(backend).context("cannot create terminal")?;
+    let mut terminal = enter_terminal(workspace.mouse_enabled())?;
 
     let res = run(&mut terminal, &mut workspace);
 
@@ -127,6 +122,50 @@ fn start(cli: Cli) -> Result<()> {
     // Persist the tabs that were open so the next launch restores them.
     workspace.save_session();
     res
+}
+
+/// Take over the terminal: raw mode (every key at once, no echo), the
+/// alternate screen (the shell's contents come back on exit), and the
+/// optional extras. Undone by [`restore_terminal`].
+fn enter_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
+    enable_raw_mode().context("cannot enable raw mode")?;
+    let mut out = stdout();
+    execute!(out, EnterAlternateScreen).context("cannot enter alternate screen")?;
+    // `[ui] mouse = false` leaves the mouse to the terminal (native text
+    // selection); everything stays reachable from the keyboard.
+    if mouse {
+        let _ = execute!(out, EnableMouseCapture);
+    }
+    // Best effort: older Windows consoles support neither. Pastes then
+    // arrive as key presses and are caught by `input::paste_text`.
+    let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
+    // The window or tab says what is running in it, not the shell's name.
+    let _ = execute!(out, SetTitle("ActiveGit"));
+    Terminal::new(CrosstermBackend::new(out)).context("cannot create terminal")
+}
+
+/// Show the start screen; `None` means the user quit from it.
+fn pick_project(config: &Config, recents: Vec<PathBuf>) -> Result<Option<PathBuf>> {
+    let mut terminal = enter_terminal(config.ui.mouse)?;
+    let choice = start::choose(&mut terminal, config.theme, recents);
+    restore_terminal(&mut terminal);
+    Ok(match choice? {
+        start::Choice::Open(root) => Some(root),
+        start::Choice::Quit => None,
+    })
+}
+
+/// Where `root` sits among the projects to open, adding it when new.
+fn project_index(paths: &mut Vec<PathBuf>, root: PathBuf) -> usize {
+    let canon = |p: &PathBuf| dunce::canonicalize(p).unwrap_or_else(|_| p.clone());
+    let wanted = canon(&root);
+    match paths.iter().position(|p| canon(p) == wanted) {
+        Some(index) => index,
+        None => {
+            paths.push(root);
+            paths.len() - 1
+        }
+    }
 }
 
 /// Decide which projects to open at startup.
@@ -215,74 +254,14 @@ struct Cli {
     /// `--hold`: wait for Enter before closing after a startup error (the
     /// shortcut passes it; its window would vanish with the message).
     hold: bool,
+    /// `--pick`: show the start screen and choose a project first.
+    pick: bool,
 }
 
 const USAGE: &str =
     "usage: activegit [--theme <name>] [--no-welcome] [--repo <path>]... [<path>...] [-- <path>...]
+       activegit --pick        choose the project to open on a start screen
        activegit --shortcut    add ActiveGit to the Start menu and desktop (Windows)";
-
-/// What a line typed at the "which repository?" prompt means.
-#[derive(Debug, PartialEq, Eq)]
-enum RepoAnswer {
-    Quit,
-    Open(PathBuf),
-    /// A folder that is not a repository yet: offer `git init`.
-    NotARepo(PathBuf),
-    Invalid(String),
-}
-
-fn read_repo_answer(line: &str) -> RepoAnswer {
-    // Paths dragged onto a terminal arrive wrapped in quotes.
-    let line = line.trim().trim_matches('"');
-    if line.is_empty() {
-        return RepoAnswer::Quit;
-    }
-    let path = match Repo::normalize_project_input(line) {
-        Ok(path) => path,
-        Err(e) => return RepoAnswer::Invalid(e.to_string()),
-    };
-    match Repo::discover_root(&path) {
-        Ok(root) => RepoAnswer::Open(root),
-        Err(_) if path.is_dir() => RepoAnswer::NotARepo(path),
-        Err(e) => RepoAnswer::Invalid(e.to_string()),
-    }
-}
-
-/// Plain prompt, before the TUI takes over the terminal: which repository
-/// to open. `None` means the user chose to quit.
-fn ask_for_repository(reason: &str) -> Result<Option<PathBuf>> {
-    let stdin = std::io::stdin();
-    let ask = |prompt: &str| -> Result<String> {
-        print!("{prompt}");
-        stdout().flush().ok();
-        let mut line = String::new();
-        stdin.read_line(&mut line).context("cannot read input")?;
-        Ok(line)
-    };
-    println!("ActiveGit");
-    println!();
-    println!("No repository to open yet ({reason}).");
-    println!("Type the path of a git repository (~ works, and you can drag a");
-    println!("folder into this window), or press Enter to quit.");
-    loop {
-        println!();
-        match read_repo_answer(&ask("> ")?) {
-            RepoAnswer::Quit => return Ok(None),
-            RepoAnswer::Open(path) => return Ok(Some(path)),
-            RepoAnswer::Invalid(message) => println!("{message}"),
-            RepoAnswer::NotARepo(path) => {
-                let answer = ask(&format!(
-                    "{} is not a git repository. Create one there? [y/N] ",
-                    path.display()
-                ))?;
-                if answer.trim().eq_ignore_ascii_case("y") {
-                    Repo::init(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    return Ok(Some(path));
-                }
-            }
-        }
-    }
-}
 
 fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli> {
     let mut cli = Cli {
@@ -291,6 +270,7 @@ fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli
         no_welcome: false,
         shortcut: false,
         hold: false,
+        pick: false,
     };
     let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
@@ -311,6 +291,8 @@ fn parse_args(args: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Cli
             cli.shortcut = true;
         } else if arg == "--hold" {
             cli.hold = true;
+        } else if arg == "--pick" {
+            cli.pick = true;
         } else if arg == "--theme" {
             let name = args.next().context("--theme needs a value")?;
             cli.theme = Some(
@@ -680,34 +662,20 @@ mod tests {
         let cli = parse_args(args(&["--hold"])).unwrap();
         assert!(cli.hold && !cli.shortcut && cli.paths.is_empty());
         assert!(!parse_args(args(&[])).unwrap().hold);
+        let cli = parse_args(args(&["--hold", "--pick"])).unwrap();
+        assert!(cli.hold && cli.pick);
+        assert!(!parse_args(args(&["--hold"])).unwrap().pick);
     }
 
     #[test]
-    fn repository_prompt_answers() {
-        assert_eq!(read_repo_answer(""), RepoAnswer::Quit);
-        assert_eq!(read_repo_answer("  \r\n"), RepoAnswer::Quit);
-        assert!(matches!(
-            read_repo_answer("/definitely/not/here-activegit-xyz"),
-            RepoAnswer::Invalid(_)
-        ));
-        let repo = tempfile::TempDir::new().unwrap();
-        init_repo(&repo);
-        let nested = repo.path().join("src");
-        std::fs::create_dir_all(&nested).unwrap();
-        // A folder inside a repository opens that repository; quotes from
-        // a drag-and-drop are fine.
-        let quoted = format!("\"{}\"\n", nested.display());
-        match read_repo_answer(&quoted) {
-            RepoAnswer::Open(root) => assert_eq!(
-                dunce::canonicalize(root).unwrap(),
-                dunce::canonicalize(repo.path()).unwrap()
-            ),
-            other => panic!("got {other:?}"),
-        }
-        let plain = tempfile::TempDir::new().unwrap();
-        assert_eq!(
-            read_repo_answer(&plain.path().display().to_string()),
-            RepoAnswer::NotARepo(plain.path().to_path_buf())
-        );
+    fn picked_project_joins_the_session_or_selects_its_tab() {
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        let mut paths = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        assert_eq!(project_index(&mut paths, b.path().to_path_buf()), 1);
+        assert_eq!(paths.len(), 2);
+        let c = tempfile::TempDir::new().unwrap();
+        assert_eq!(project_index(&mut paths, c.path().to_path_buf()), 2);
+        assert_eq!(paths[2], c.path());
     }
 }

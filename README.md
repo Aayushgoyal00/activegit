@@ -153,10 +153,16 @@ icon. To keep it on the taskbar, right-click either one and choose **Pin
 to taskbar** (on Windows 11 it is under *Show more options*); Windows does
 not let a program pin itself.
 
-Clicking it opens a terminal window running ActiveGit with the projects
-you had open last time. The first time, when there is nothing to reopen,
-it asks which repository to open: type a path or drag a folder into the
-window.
+Clicking it opens a terminal window on the start screen: the projects you
+had open last time, your home folder and every drive. Pick one with the
+arrow keys or the mouse and press `enter`; `→` goes into a folder, `←`
+goes back up (past the top of a drive to the list of drives), typing
+filters the list, and `tab` takes a typed path (or drag a folder into the
+window). `esc` quits. The other projects from last time open as tabs
+beside the one you picked.
+
+ActiveGit is a terminal program, so the window it runs in is always a
+terminal window; there is no separate graphical window.
 
 If Windows Terminal is your default terminal, the running window shows up
 on the taskbar under Windows Terminal's icon, next to the pinned ActiveGit
@@ -198,8 +204,9 @@ usage: activegit [--theme <name>] [--no-welcome]
 
 `--` treats everything after it as paths; `--theme` overrides the config
 file for one run. With no paths, the last session's projects are reopened
-(falling back to the current directory). Started somewhere that is not a
-repository with nothing to reopen, it asks for one instead of failing.
+(falling back to the current directory). `--pick` shows the start screen
+first, to choose the project to open; so does starting somewhere that is
+not a repository with nothing to reopen.
 
 **First commit in 10 seconds:** `j`/`k` to pick a file → `space` to stage →
 `c` to open the commit box → type (or `Ctrl+G`) → `enter`.
@@ -331,7 +338,8 @@ project bar shows dirty-file counts and stays visible in fullscreen diff.
 
 - `[` / `]` cycle projects · `q` closes the current one (the last one quits) · `Q` quits all
 - `o` opens the directory browser: type to filter, `enter` opens a repo
-  (or offers `git init` in a plain folder), `tab` jumps to a typed path
+  (or offers `git init` in a plain folder), `tab` jumps to a typed path;
+  going up from the top of a drive lists the home folder and every drive
 - Open projects and the active tab persist in `session.toml` and are
   restored on next launch (dead paths are dropped)
 

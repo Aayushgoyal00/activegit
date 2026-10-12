@@ -508,9 +508,16 @@ pub enum BrowserRow {
 /// Directory picker behind `Mode::OpenProject`. Row 0 is always `.`
 /// (open this folder), row 1 is `..` (parent), then the visible
 /// subdirectories (all of them, or the type-to-filter matches).
+///
+/// Above the top of every drive sits the places level (an empty `cwd`):
+/// no `.`/`..` there, just the recent projects, the home folder and the
+/// drives, so another drive is reachable without typing its path.
 #[derive(Debug, Clone)]
 pub struct OpenBrowser {
     pub cwd: std::path::PathBuf,
+    /// Projects listed first at the places level (the start screen's
+    /// recent projects); empty for the in-app browser.
+    pub recents: Vec<std::path::PathBuf>,
     pub entries: Vec<DirEntry>,
     /// Subset of `entries` shown: everything without a filter, the
     /// case-insensitive substring matches with one.
@@ -525,13 +532,58 @@ pub struct OpenBrowser {
 }
 
 impl OpenBrowser {
+    /// A browser at `start` (the places level when it is empty).
+    pub fn new(start: std::path::PathBuf, recents: Vec<std::path::PathBuf>) -> Self {
+        let mut browser = Self {
+            cwd: start,
+            recents,
+            entries: Vec::new(),
+            view: Vec::new(),
+            // Row 0 is `.` (the folder itself); row 1 is `..`, then dirs.
+            selected: 0,
+            error: None,
+            editing_path: false,
+            filter: String::new(),
+        };
+        browser.rescan();
+        browser
+    }
+
+    /// At the places level: above every drive, nothing to open as `.`.
+    pub fn at_places(&self) -> bool {
+        self.cwd.as_os_str().is_empty()
+    }
+
+    /// The `.` and `..` rows, which the places level does not have.
+    fn fixed_rows(&self) -> usize {
+        if self.at_places() {
+            0
+        } else {
+            2
+        }
+    }
+
+    /// Where `..` leads: the parent folder, the places level from the top
+    /// of a drive, nowhere from the places level itself.
+    pub fn parent(&self) -> Option<std::path::PathBuf> {
+        if self.at_places() {
+            return None;
+        }
+        match self.cwd.parent() {
+            Some(parent) => Some(parent.to_path_buf()),
+            None => Some(std::path::PathBuf::new()),
+        }
+    }
+
     /// Rows in the list: `.` + `..` + one per visible subdirectory.
     pub fn row_count(&self) -> usize {
-        self.view.len() + 2
+        self.view.len() + self.fixed_rows()
     }
 
     pub fn row(&self, index: usize) -> BrowserRow {
-        if index == 0 {
+        if self.at_places() {
+            BrowserRow::Dir(index)
+        } else if index == 0 {
             BrowserRow::Current
         } else if index == 1 {
             BrowserRow::Parent
@@ -549,11 +601,7 @@ impl OpenBrowser {
     pub fn selected_path(&self) -> std::path::PathBuf {
         match self.selected_row() {
             BrowserRow::Current => self.cwd.clone(),
-            BrowserRow::Parent => self
-                .cwd
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| self.cwd.clone()),
+            BrowserRow::Parent => self.parent().unwrap_or_else(|| self.cwd.clone()),
             BrowserRow::Dir(i) => self
                 .view
                 .get(i)
@@ -595,8 +643,8 @@ impl OpenBrowser {
             .cloned()
             .collect();
         if !self.view.is_empty() {
-            // First match sits at row 2 (after `.` and `..`).
-            self.selected = 2;
+            // First match sits after `.` and `..`.
+            self.selected = self.fixed_rows();
         }
         self.selected = self.selected.min(self.row_count().saturating_sub(1));
     }
@@ -614,7 +662,7 @@ impl OpenBrowser {
     /// old listing when the directory cannot be read. Moving folders
     /// resets the cursor and drops any active filter.
     pub fn rescan(&mut self) {
-        match read_subdirs(&self.cwd) {
+        match self.list(&self.cwd) {
             Ok(entries) => {
                 self.entries = entries;
                 self.error = None;
@@ -632,7 +680,7 @@ impl OpenBrowser {
     /// Move the browser to `dir`, rescanning only when it reads cleanly.
     /// Returns false (and keeps the old folder) on unreadable targets.
     pub fn goto(&mut self, dir: std::path::PathBuf) -> bool {
-        match read_subdirs(&dir) {
+        match self.list(&dir) {
             Ok(entries) => {
                 self.cwd = dir;
                 self.entries = entries;
@@ -648,6 +696,50 @@ impl OpenBrowser {
             }
         }
     }
+}
+
+impl OpenBrowser {
+    /// What `dir` holds: its subfolders, or the places for the empty path.
+    fn list(&self, dir: &std::path::Path) -> Result<Vec<DirEntry>, String> {
+        if dir.as_os_str().is_empty() {
+            Ok(places(&self.recents))
+        } else {
+            read_subdirs(dir)
+        }
+    }
+}
+
+/// The places level: recent projects, the home folder, then every drive
+/// (the filesystem root elsewhere). Names are full paths.
+fn places(recents: &[std::path::PathBuf]) -> Vec<DirEntry> {
+    let mut paths: Vec<std::path::PathBuf> = recents.to_vec();
+    paths.extend(git_tui_core::repo::home_dir());
+    paths.extend(drives());
+    let mut out: Vec<DirEntry> = Vec::new();
+    for path in paths {
+        let name = path.display().to_string();
+        if out.iter().all(|e| e.name != name) {
+            out.push(DirEntry {
+                name,
+                is_repo_root: path.join(".git").exists(),
+            });
+        }
+    }
+    out
+}
+
+/// The roots a path can start from: `C:\`, `D:\`, ... on Windows.
+#[cfg(windows)]
+fn drives() -> Vec<std::path::PathBuf> {
+    ('A'..='Z')
+        .map(|letter| std::path::PathBuf::from(format!("{letter}:\\")))
+        .filter(|drive| drive.is_dir())
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn drives() -> Vec<std::path::PathBuf> {
+    vec![std::path::PathBuf::from("/")]
 }
 
 /// Subdirectories of `dir`, sorted by name. Files are hidden: only
@@ -829,18 +921,7 @@ impl App {
         self.mode = Mode::OpenProject;
         self.draft.clear();
         self.error = None;
-        let mut browser = OpenBrowser {
-            cwd: start,
-            entries: Vec::new(),
-            view: Vec::new(),
-            // Row 0 is `.` (the folder itself); row 1 is `..`, then dirs.
-            selected: 0,
-            error: None,
-            editing_path: false,
-            filter: String::new(),
-        };
-        browser.rescan();
-        self.open_browser = Some(browser);
+        self.open_browser = Some(OpenBrowser::new(start, Vec::new()));
     }
 
     pub fn open_browser(&self) -> Option<&OpenBrowser> {

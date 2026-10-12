@@ -3210,30 +3210,30 @@ fn render_input_modal(frame: &mut Frame, area: Rect, app: &App, title: &str) {
 /// folder itself, `..` goes up, subfolders open as projects (plain ones
 /// offer `git init`). Repo roots carry a `[repo]` badge, folders already
 /// open as tabs carry `[open]`.
-fn render_open_browser_modal(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
+/// What the project browser shows inside its frame: the folder heading,
+/// the path / filter / error lines, then the rows that fit. `top` is the
+/// screen row of the first line; the second value maps screen rows to list
+/// indexes for mouse clicks.
+pub(crate) fn browser_lines(
+    browser: &crate::app::OpenBrowser,
+    theme: Theme,
+    (inner_w, inner_h): (usize, usize),
+    top: u16,
     open_roots: &[std::path::PathBuf],
-) {
+    path_visible: &str,
+) -> (Vec<Line<'static>>, Vec<(u16, usize)>) {
     use crate::app::BrowserRow;
-    let theme = app.theme();
-    let Some(browser) = app.open_browser() else {
-        return;
-    };
-    let popup = centered_rect(area, 76, 18);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
-    let block = panel_block(true, theme, " Open project ".to_string());
-    let inner_w = popup.width.saturating_sub(2) as usize;
-    let inner_h = popup.height.saturating_sub(2) as usize;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
 
     // Current folder on top (left-truncated when too long).
-    let cwd = tail_fit(
-        &browser.cwd.display().to_string(),
-        inner_w.saturating_sub(2),
-    );
+    let cwd = if browser.at_places() {
+        PLACES_TITLE.to_string()
+    } else {
+        tail_fit(
+            &browser.cwd.display().to_string(),
+            inner_w.saturating_sub(2),
+        )
+    };
     lines.push(Line::from(vec![
         Span::styled(
             "> ",
@@ -3247,14 +3247,9 @@ fn render_open_browser_modal(
         ),
     ]));
     if browser.editing_path {
-        let (visible, _) = input_window(
-            app.draft(),
-            app.draft_cursor(),
-            inner_w.saturating_sub("path: ".len()),
-        );
         lines.push(Line::from(vec![
             Span::styled("path: ", Style::default().fg(theme.hint)),
-            Span::styled(visible, Style::default().fg(theme.fg)),
+            Span::styled(path_visible.to_string(), Style::default().fg(theme.fg)),
         ]));
     }
     if !browser.filter.is_empty() {
@@ -3290,10 +3285,7 @@ fn render_open_browser_modal(
     // Screen-row → browser-list-index hits for mouse clicks.
     let mut hit: Vec<(u16, usize)> = Vec::new();
     for (row, index) in (start..total).take(rows).enumerate() {
-        hit.push((
-            popup.y.saturating_add(1).saturating_add(lines.len() as u16),
-            start + row,
-        ));
+        hit.push((top.saturating_add(lines.len() as u16), start + row));
         let selected = start + row == cursor;
         let style = if selected {
             selection_style(theme)
@@ -3323,7 +3315,13 @@ fn render_open_browser_modal(
                     .get(i)
                     .map(|e| (e.name.clone(), e.is_repo_root))
                     .unwrap_or_default();
-                spans.push(Span::styled(format!("{name}/"), style));
+                // Places are full paths (`C:\`), not folder names.
+                let label = if browser.at_places() {
+                    name.clone()
+                } else {
+                    format!("{name}/")
+                };
+                spans.push(Span::styled(label, style));
                 if is_repo {
                     spans.push(Span::styled(
                         " [repo]".to_string(),
@@ -3353,6 +3351,113 @@ fn render_open_browser_modal(
         ));
         lines.push(Line::from(spans));
     }
+    (lines, hit)
+}
+
+/// The start screen (`activegit --pick`): the project browser on its own,
+/// full height, before any project is open.
+pub fn render_start(frame: &mut Frame, screen: &mut crate::start::StartScreen, theme: Theme) {
+    let area = frame.area();
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
+    let width = area.width.min(92);
+    let x = area.x + (area.width - width) / 2;
+    let line_at = |y: u16| Rect::new(x, area.y + y, width, 1);
+    if area.height < 8 || width < 24 {
+        frame.render_widget(Paragraph::new("ActiveGit: window too small"), area);
+        screen.hits.clear();
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " ActiveGit",
+                Style::default()
+                    .fg(theme.border_focused)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "   which project do you want to open?",
+                Style::default().fg(theme.hint),
+            ),
+        ])),
+        line_at(1),
+    );
+    let list = Rect::new(x, area.y + 3, width, area.height - 6);
+    let inner_w = list.width.saturating_sub(2) as usize;
+    let inner_h = list.height.saturating_sub(2) as usize;
+    let path_visible = tail_fit(
+        &screen.path_line,
+        inner_w.saturating_sub("path: ".len() + 1),
+    );
+    let (lines, hits) = browser_lines(
+        &screen.browser,
+        theme,
+        (inner_w, inner_h),
+        list.y + 1,
+        &[],
+        &path_visible,
+    );
+    screen.hits = hits;
+    let block = panel_block(true, theme, " Open project ".to_string());
+    frame.render_widget(Paragraph::new(lines).block(block), list);
+    if screen.browser.editing_path {
+        let cursor_x = list.x + 1 + "path: ".len() as u16 + path_visible.width() as u16;
+        frame.set_cursor_position((cursor_x.min(list.x + list.width - 2), list.y + 2));
+    }
+    let footer = match &screen.confirm_init {
+        Some(dir) => Line::from(vec![Span::styled(
+            format!(
+                " Not a git repository yet: {}   enter: create one here (git init) · esc: back",
+                tail_fit(&dir.display().to_string(), 30)
+            ),
+            Style::default()
+                .fg(theme.branch_current)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        None if screen.browser.editing_path => Line::styled(
+            " enter: go to this folder · esc: cancel",
+            Style::default().fg(theme.hint),
+        ),
+        None => Line::styled(
+            " enter: open · \u{2192}: into · \u{2190}: up · type: filter · tab: type a path · esc: quit",
+            Style::default().fg(theme.hint),
+        ),
+    };
+    frame.render_widget(Paragraph::new(footer), line_at(area.height - 2));
+}
+
+/// Heading of the browser's places level (above every drive).
+pub(crate) const PLACES_TITLE: &str = "Projects, home folder and drives";
+
+fn render_open_browser_modal(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    open_roots: &[std::path::PathBuf],
+) {
+    let theme = app.theme();
+    let Some(browser) = app.open_browser() else {
+        return;
+    };
+    let popup = centered_rect(area, 76, 18);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.bg)), popup);
+    let block = panel_block(true, theme, " Open project ".to_string());
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let inner_h = popup.height.saturating_sub(2) as usize;
+    let (path_visible, _) = input_window(
+        app.draft(),
+        app.draft_cursor(),
+        inner_w.saturating_sub("path: ".len()),
+    );
+    let (lines, hit) = browser_lines(
+        browser,
+        theme,
+        (inner_w, inner_h),
+        popup.y.saturating_add(1),
+        open_roots,
+        &path_visible,
+    );
     app.set_hit(HitMap::Browser, hit);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
     popup_buttons(frame, app, popup, &[("Open", OK), ("Close", CANCEL)]);
@@ -6300,5 +6405,45 @@ mod tests {
                 "{key} missing from help"
             );
         }
+    }
+    #[test]
+    fn start_screen_lists_recent_projects_and_drives() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let mut start = crate::start::StartScreen::new(vec![dir.path().to_path_buf()]);
+        let draw = |start: &mut crate::start::StartScreen| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|f| render_start(f, start, Theme::default_theme()))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let mut out = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    out.push_str(buf[(x, y)].symbol());
+                }
+                out.push('\n');
+            }
+            out
+        };
+        let text = draw(&mut start);
+        assert!(text.contains("ActiveGit"), "{text}");
+        assert!(text.contains(PLACES_TITLE), "{text}");
+        assert!(text.contains("[repo]"), "{text}");
+        assert!(text.contains("esc: quit"), "{text}");
+        // One clickable row per place, the first under the heading.
+        assert_eq!(start.hits.len(), start.browser.view.len());
+        assert_eq!(start.hits[0], (5, 0));
+        // Inside a folder the usual `.` and `..` rows are back.
+        let root = std::path::PathBuf::from(&start.browser.view.last().unwrap().name);
+        start.browser.goto(root);
+        let text = draw(&mut start);
+        assert!(text.contains("(open this folder)"), "{text}");
+        assert!(text.contains("../"), "{text}");
+        // Too small to draw: no panic, nothing clickable.
+        let mut tiny = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        tiny.draw(|f| render_start(f, &mut start, Theme::default_theme()))
+            .unwrap();
+        assert!(start.hits.is_empty());
     }
 }

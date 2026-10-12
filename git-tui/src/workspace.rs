@@ -288,11 +288,8 @@ impl Workspace {
     }
 
     pub fn goto_parent(&mut self) {
-        let parent = self
-            .current()
-            .open_browser()
-            .and_then(|b| b.cwd.parent().map(|p| p.to_path_buf()));
-        // No parent means the filesystem root: nothing to do.
+        let parent = self.current().open_browser().and_then(|b| b.parent());
+        // No parent means the places level: nothing above it.
         if let Some(parent) = parent {
             if let Some(b) = self.current_mut().open_browser_mut() {
                 b.goto(parent);
@@ -302,10 +299,7 @@ impl Workspace {
 
     /// Go up one level regardless of the highlighted row (`←`/`h`).
     pub fn browser_up(&mut self) {
-        let parent = self
-            .current()
-            .open_browser()
-            .and_then(|b| b.cwd.parent().map(|p| p.to_path_buf()));
+        let parent = self.current().open_browser().and_then(|b| b.parent());
         if let Some(parent) = parent {
             if let Some(b) = self.current_mut().open_browser_mut() {
                 b.goto(parent);
@@ -1709,5 +1703,43 @@ mod tests {
         ws.on_key(KeyCode::Esc);
         assert!(ws.apps.iter().all(|app| *app.llm() == llm));
         assert_eq!(ws.config.llm, llm, "tabs opened later get it too");
+    }
+    #[test]
+    fn browser_climbs_past_the_drive_to_the_places_and_into_another_one() {
+        let a = init_repo_with_file("a", "a.txt", "a\n");
+        let mut ws = Workspace::open(vec![a.path().to_path_buf()], Config::default()).unwrap();
+        ws.on_key(KeyCode::Char('o'));
+        // Up and up: past the top of the drive is the list of places.
+        for _ in 0..64 {
+            ws.on_key(KeyCode::Left);
+        }
+        let b = ws.current().open_browser().unwrap();
+        assert!(b.at_places(), "stuck at {}", b.cwd.display());
+        assert!(b.error.is_none());
+        // No `.` / `..` rows up here, and nothing further up.
+        assert_eq!(b.row_count(), b.view.len());
+        assert!(!b.view.is_empty());
+        assert!(b.parent().is_none());
+        // Every drive (or `/`) is listed and can be entered.
+        let last = b.view.len() - 1;
+        let drive = std::path::PathBuf::from(&b.view[last].name);
+        assert!(
+            drive.parent().is_none(),
+            "{} is not a root",
+            drive.display()
+        );
+        ws.current_mut().set_browser_selected(last);
+        ws.on_key(KeyCode::Enter);
+        assert_eq!(ws.current().mode(), Mode::OpenProject);
+        let b = ws.current().open_browser().unwrap();
+        assert_eq!(b.cwd, drive);
+        // `..` from the top of the drive leads back to the places.
+        ws.current_mut().set_browser_selected(1);
+        ws.on_key(KeyCode::Enter);
+        assert!(ws.current().open_browser().unwrap().at_places());
+        // Typing filters the places too.
+        ws.on_key(KeyCode::Char('~'));
+        ws.on_key(KeyCode::Char('~'));
+        assert!(ws.current().open_browser().unwrap().view.is_empty());
     }
 }
