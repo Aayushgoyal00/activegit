@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod drives;
 mod fuzzy;
 mod input;
 mod markdown;
@@ -30,7 +31,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use session::Session;
 use std::ffi::OsString;
-use std::io::{stdout, IsTerminal};
+use std::io::{stdout, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use workspace::Workspace;
@@ -144,10 +145,55 @@ fn enter_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<std::io::Stdo
     Terminal::new(CrosstermBackend::new(out)).context("cannot create terminal")
 }
 
+/// Tells the terminal which mouse pointer to show (OSC 22: a hand over
+/// clickable things). Terminals that do not know the sequence ignore it,
+/// and the pointer stays whatever the terminal uses.
+pub(crate) struct PointerShape {
+    shown: app::Pointer,
+    enabled: bool,
+}
+
+impl PointerShape {
+    fn new() -> Self {
+        Self {
+            shown: app::Pointer::Default,
+            // A console without escape-sequence support would print it.
+            #[cfg(windows)]
+            enabled: crossterm::ansi_support::supports_ansi(),
+            #[cfg(not(windows))]
+            enabled: true,
+        }
+    }
+
+    pub(crate) fn set(&mut self, pointer: app::Pointer) {
+        if pointer == self.shown {
+            return;
+        }
+        self.shown = pointer;
+        if self.enabled {
+            let mut out = stdout();
+            let _ = write!(out, "\x1b]22;{}\x1b\\", pointer_name(pointer));
+            let _ = out.flush();
+        }
+    }
+}
+
+/// The CSS cursor names OSC 22 uses.
+fn pointer_name(pointer: app::Pointer) -> &'static str {
+    match pointer {
+        app::Pointer::Default => "default",
+        app::Pointer::Hand => "pointer",
+        app::Pointer::ResizeColumns => "ew-resize",
+        app::Pointer::ResizeRows => "ns-resize",
+    }
+}
+
 /// Show the start screen; `None` means the user quit from it.
 fn pick_project(config: &Config, recents: Vec<PathBuf>) -> Result<Option<PathBuf>> {
     let mut terminal = enter_terminal(config.ui.mouse)?;
-    let choice = start::choose(&mut terminal, config.theme, recents);
+    let mut pointer = PointerShape::new();
+    let choice = start::choose(&mut terminal, config.theme, recents, &mut pointer);
+    pointer.set(app::Pointer::Default);
     restore_terminal(&mut terminal);
     Ok(match choice? {
         start::Choice::Open(root) => Some(root),
@@ -345,6 +391,10 @@ fn run(
     let mut welcome_was_visible = workspace.welcome_visible();
     let mut last_draw: Option<Instant> = None;
     let mut last_paste: Option<Instant> = None;
+    let mut pointer = PointerShape::new();
+    // Where the mouse last was: what is under it can change without it
+    // moving (a popup opens), so the pointer is rechecked after each draw.
+    let mut mouse_at: Option<(u16, u16)> = None;
     loop {
         let tick = if workspace.busy() {
             BUSY_TICK
@@ -360,6 +410,11 @@ fn run(
                 batch.push(event::read().context("cannot read input")?);
                 if !event::poll(Duration::ZERO).context("cannot poll input")? {
                     break;
+                }
+            }
+            for event in &batch {
+                if let Event::Mouse(m) = event {
+                    mouse_at = Some((m.column, m.row));
                 }
             }
             redraw |= handle_batch(batch, workspace, &mut last_paste);
@@ -378,7 +433,11 @@ fn run(
                 .context("cannot render")?;
             last_draw = Some(Instant::now());
         }
+        if let Some((col, row)) = mouse_at {
+            pointer.set(workspace.pointer_at(col, row));
+        }
         if workspace.should_quit() {
+            pointer.set(app::Pointer::Default);
             return Ok(());
         }
     }
@@ -609,6 +668,8 @@ mod tests {
             None
         );
         assert_eq!(map_mouse(MouseEventKind::Moved, 3, 4), None);
+        assert_eq!(pointer_name(app::Pointer::Hand), "pointer");
+        assert_eq!(pointer_name(app::Pointer::Default), "default");
     }
 
     fn init_repo(dir: &tempfile::TempDir) {

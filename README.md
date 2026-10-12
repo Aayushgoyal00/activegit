@@ -153,8 +153,9 @@ icon. To keep it on the taskbar, right-click either one and choose **Pin
 to taskbar** (on Windows 11 it is under *Show more options*); Windows does
 not let a program pin itself.
 
-Clicking it opens a terminal window on the start screen: the projects you
-had open last time, your home folder and every drive. Pick one with the
+Clicking it opens a terminal window on the start screen, laid out like
+This PC: every drive with its name and free space, your home folder, then
+the projects you had open last time. Pick one with the
 arrow keys or the mouse and press `enter`; `→` goes into a folder, `←`
 goes back up (past the top of a drive to the list of drives), typing
 filters the list, and `tab` takes a typed path (or drag a folder into the

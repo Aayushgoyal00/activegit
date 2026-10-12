@@ -3221,6 +3221,7 @@ pub(crate) fn browser_lines(
     top: u16,
     open_roots: &[std::path::PathBuf],
     path_visible: &str,
+    hover: Option<usize>,
 ) -> (Vec<Line<'static>>, Vec<(u16, usize)>) {
     use crate::app::BrowserRow;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
@@ -3289,6 +3290,12 @@ pub(crate) fn browser_lines(
         let selected = start + row == cursor;
         let style = if selected {
             selection_style(theme)
+        } else if hover == Some(index) {
+            // The row under the mouse: one click selects it.
+            Style::default()
+                .fg(theme.border_focused)
+                .bg(theme.bg)
+                .add_modifier(Modifier::UNDERLINED)
         } else {
             Style::default().fg(theme.fg).bg(theme.bg)
         };
@@ -3310,10 +3317,10 @@ pub(crate) fn browser_lines(
                 spans.push(Span::styled("../".to_string(), style));
             }
             BrowserRow::Dir(i) => {
-                let (name, is_repo) = browser
+                let (name, note, is_repo) = browser
                     .view
                     .get(i)
-                    .map(|e| (e.name.clone(), e.is_repo_root))
+                    .map(|e| (e.name.clone(), e.note.clone(), e.is_repo_root))
                     .unwrap_or_default();
                 // Places are full paths (`C:\`), not folder names.
                 let label = if browser.at_places() {
@@ -3322,6 +3329,14 @@ pub(crate) fn browser_lines(
                     format!("{name}/")
                 };
                 spans.push(Span::styled(label, style));
+                if !note.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  {note}"),
+                        Style::default()
+                            .fg(theme.hint)
+                            .bg(style.bg.unwrap_or(theme.bg)),
+                    ));
+                }
                 if is_repo {
                     spans.push(Span::styled(
                         " [repo]".to_string(),
@@ -3396,6 +3411,7 @@ pub fn render_start(frame: &mut Frame, screen: &mut crate::start::StartScreen, t
         list.y + 1,
         &[],
         &path_visible,
+        screen.hover,
     );
     screen.hits = hits;
     let block = panel_block(true, theme, " Open project ".to_string());
@@ -3427,7 +3443,7 @@ pub fn render_start(frame: &mut Frame, screen: &mut crate::start::StartScreen, t
 }
 
 /// Heading of the browser's places level (above every drive).
-pub(crate) const PLACES_TITLE: &str = "Projects, home folder and drives";
+pub(crate) const PLACES_TITLE: &str = "This PC: drives, home folder, recent projects";
 
 fn render_open_browser_modal(
     frame: &mut Frame,
@@ -3457,6 +3473,7 @@ fn render_open_browser_modal(
         popup.y.saturating_add(1),
         open_roots,
         &path_visible,
+        None,
     );
     app.set_hit(HitMap::Browser, hit);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -6430,12 +6447,14 @@ mod tests {
         assert!(text.contains("ActiveGit"), "{text}");
         assert!(text.contains(PLACES_TITLE), "{text}");
         assert!(text.contains("[repo]"), "{text}");
+        assert!(text.contains("recent project"), "{text}");
+        assert!(text.contains("home folder"), "{text}");
         assert!(text.contains("esc: quit"), "{text}");
         // One clickable row per place, the first under the heading.
         assert_eq!(start.hits.len(), start.browser.view.len());
         assert_eq!(start.hits[0], (5, 0));
         // Inside a folder the usual `.` and `..` rows are back.
-        let root = std::path::PathBuf::from(&start.browser.view.last().unwrap().name);
+        let root = std::path::PathBuf::from(&start.browser.view[0].name);
         start.browser.goto(root);
         let text = draw(&mut start);
         assert!(text.contains("(open this folder)"), "{text}");

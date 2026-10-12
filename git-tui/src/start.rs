@@ -5,7 +5,7 @@
 //! lists the recent projects, the home folder and the drives, and browses
 //! folders from there with the same picker as `o` inside the app.
 
-use crate::app::{BrowserRow, OpenBrowser};
+use crate::app::{BrowserRow, OpenBrowser, Pointer};
 use crate::config::Theme;
 use crate::input::{self, Chord, Input};
 use anyhow::{Context, Result};
@@ -36,6 +36,8 @@ pub struct StartScreen {
     pub(crate) confirm_init: Option<PathBuf>,
     /// Screen row to list index, recorded while drawing (mouse clicks).
     pub(crate) hits: Vec<(u16, usize)>,
+    /// The list row under the mouse, drawn highlighted.
+    pub(crate) hover: Option<usize>,
     last_click: Option<(Instant, u16)>,
 }
 
@@ -47,6 +49,7 @@ impl StartScreen {
             path_line: String::new(),
             confirm_init: None,
             hits: Vec::new(),
+            hover: None,
             last_click: None,
         }
     }
@@ -140,6 +143,16 @@ impl StartScreen {
         None
     }
 
+    /// The mouse moved to screen row `row`: remember the list row there.
+    /// Returns the pointer to show.
+    pub fn on_hover(&mut self, row: u16) -> Pointer {
+        self.hover = self.hits.iter().find(|(y, _)| *y == row).map(|(_, i)| *i);
+        match self.hover {
+            Some(_) => Pointer::Hand,
+            None => Pointer::Default,
+        }
+    }
+
     pub fn on_wheel(&mut self, up: bool) {
         self.browser.move_cursor(if up { -1 } else { 1 });
     }
@@ -211,6 +224,7 @@ pub fn choose(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     theme: Theme,
     recents: Vec<PathBuf>,
+    pointer: &mut crate::PointerShape,
 ) -> Result<Choice> {
     let mut screen = StartScreen::new(recents);
     loop {
@@ -250,6 +264,10 @@ pub fn choose(
                 }
                 Event::Mouse(m) => match m.kind {
                     MouseEventKind::Down(MouseButton::Left) => screen.on_click(m.row),
+                    MouseEventKind::Moved => {
+                        pointer.set(screen.on_hover(m.row));
+                        None
+                    }
                     MouseEventKind::ScrollUp => {
                         screen.on_wheel(true);
                         None
@@ -288,12 +306,15 @@ mod tests {
         let recent = repo();
         let screen = StartScreen::new(vec![recent.path().to_path_buf()]);
         assert!(screen.browser.at_places());
-        // No `.` / `..` up here: row 0 is the first recent project.
+        // No `.` / `..` up here: row 0 is the first drive, like This PC.
         assert_eq!(screen.browser.selected_row(), BrowserRow::Dir(0));
-        assert_eq!(screen.browser.selected_path(), recent.path());
-        assert!(screen.browser.view[0].is_repo_root);
-        // Home and at least one drive (or `/`) follow.
-        assert!(screen.browser.view.len() >= 2);
+        assert!(screen.browser.selected_path().parent().is_none());
+        // The home folder and the recent project follow, each labelled.
+        let last = screen.browser.view.last().unwrap();
+        assert_eq!(last.name, recent.path().display().to_string());
+        assert_eq!(last.note, "recent project");
+        assert!(last.is_repo_root);
+        assert!(screen.browser.view.iter().any(|e| e.note == "home folder"));
         assert!(screen.browser.parent().is_none());
     }
 
@@ -301,6 +322,7 @@ mod tests {
     fn enter_on_a_recent_project_opens_it() {
         let recent = repo();
         let mut screen = StartScreen::new(vec![recent.path().to_path_buf()]);
+        screen.browser.selected = screen.browser.view.len() - 1;
         match screen.on_key(KeyCode::Enter) {
             Some(Choice::Open(root)) => assert_eq!(canon(&root), canon(recent.path())),
             other => panic!("got {other:?}"),
@@ -330,8 +352,7 @@ mod tests {
         }
         assert!(screen.browser.at_places());
         // Every place is a folder that can be entered again.
-        let last = screen.browser.view.len() - 1;
-        screen.browser.selected = last;
+        screen.browser.selected = 0;
         let drive = screen.browser.selected_path();
         screen.on_key(KeyCode::Right);
         assert_eq!(screen.browser.cwd, drive);
@@ -368,12 +389,18 @@ mod tests {
     fn a_second_click_on_a_row_opens_it() {
         let recent = repo();
         let mut screen = StartScreen::new(vec![recent.path().to_path_buf()]);
-        screen.hits = vec![(5, 0), (6, 1)];
-        assert_eq!(screen.on_click(6), None);
-        assert_eq!(screen.browser.selected, 1);
+        let last = screen.browser.view.len() - 1;
+        screen.hits = vec![(5, 0), (6, last)];
         assert_eq!(screen.on_click(5), None);
         assert_eq!(screen.browser.selected, 0);
-        assert!(matches!(screen.on_click(5), Some(Choice::Open(_))));
+        assert_eq!(screen.on_click(6), None);
+        assert_eq!(screen.browser.selected, last);
+        assert!(matches!(screen.on_click(6), Some(Choice::Open(_))));
+        // Moving over a row highlights it and asks for the hand pointer.
+        assert_eq!(screen.on_hover(5), Pointer::Hand);
+        assert_eq!(screen.hover, Some(0));
+        assert_eq!(screen.on_hover(40), Pointer::Default);
+        assert_eq!(screen.hover, None);
         // A click off the list does nothing.
         assert_eq!(screen.on_click(40), None);
     }
